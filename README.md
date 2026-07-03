@@ -68,6 +68,11 @@ Point the app at your backend by setting the API base URL — see
 `mobile/src/lib/config.ts` (Android emulator uses `10.0.2.2`; a physical phone
 needs your laptop's LAN IP, e.g. `EXPO_PUBLIC_API_URL=http://192.168.1.42:8000`).
 
+📖 **Full step-by-step (tooling, emulator, networking, troubleshooting):
+[docs/MOBILE_SETUP.md](docs/MOBILE_SETUP.md).** The map screen targets the
+MapLibre React Native **v11** API (`Map`/`GeoJSONSource`/`Layer`, named exports,
+no access token).
+
 ## API surface
 
 | Method | Path | Purpose |

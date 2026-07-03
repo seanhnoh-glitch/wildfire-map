@@ -1,24 +1,24 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import { Alert, StyleSheet, View } from "react-native";
 import * as Location from "expo-location";
-import MapLibreGL from "@maplibre/maplibre-react-native";
+// MapLibre React Native v11: named exports; MapView->Map, ShapeSource->GeoJSONSource,
+// FillLayer/LineLayer/CircleLayer -> unified <Layer type=... paint=... />.
+// (setAccessToken was removed in v11 — MapLibre needs no token.)
+import { Map, Camera, GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
 
 import { api, type Fire, type NearbyFiresResponse, type PredictResponse } from "../lib/api";
 import { OSM_RASTER_STYLE } from "../lib/mapStyle";
 import { SearchBar } from "../components/SearchBar";
 import { FireInfoSheet } from "../components/FireInfoSheet";
 
-// MapLibre needs no access token; set to null explicitly.
-MapLibreGL.setAccessToken(null);
-
 const DEFAULT_CENTER: [number, number] = [-119.4, 37.5]; // California
 const FIRE_COLOR = "#d85a30";
 const PERIM_COLOR = "#b5321f";
 
 export default function MapScreen() {
-  const cameraRef = useRef<MapLibreGL.Camera>(null);
-  const [center, setCenter] = useState<[number, number]>(DEFAULT_CENTER);
-  const [zoom, setZoom] = useState(6);
+  const cameraRef = useRef<any>(null);
+  const [center] = useState<[number, number]>(DEFAULT_CENTER);
+  const [zoom] = useState(6);
   const [data, setData] = useState<NearbyFiresResponse | null>(null);
   const [selected, setSelected] = useState<Fire | null>(null);
   const [prediction, setPrediction] = useState<PredictResponse | null>(null);
@@ -27,8 +27,6 @@ export default function MapScreen() {
   const [visibleHour, setVisibleHour] = useState(6);
 
   const flyTo = useCallback((lon: number, lat: number, z = 9) => {
-    setCenter([lon, lat]);
-    setZoom(z);
     cameraRef.current?.setCamera({
       centerCoordinate: [lon, lat],
       zoomLevel: z,
@@ -107,7 +105,7 @@ export default function MapScreen() {
     }
   }, [selected]);
 
-  // FeatureCollection of fire points for a symbol/circle layer.
+  // FeatureCollection of fire points for the circle layer.
   const firePoints = useMemo(() => {
     const feats = (data?.fires ?? []).map((f) => ({
       type: "Feature" as const,
@@ -133,86 +131,78 @@ export default function MapScreen() {
 
   return (
     <View style={styles.container}>
-      <MapLibreGL.MapView
-        style={styles.map}
-        mapStyle={OSM_RASTER_STYLE as any}
-        onPress={() => setSelected(null)}
-      >
-        <MapLibreGL.Camera ref={cameraRef} defaultSettings={{ centerCoordinate: center, zoomLevel: zoom }} />
+      <Map style={styles.map} mapStyle={OSM_RASTER_STYLE as any} onPress={() => setSelected(null)}>
+        <Camera ref={cameraRef} defaultSettings={{ centerCoordinate: center, zoomLevel: zoom }} />
+
+        {/* Declaration order = draw order (bottom -> top). */}
 
         {/* Official mapped perimeters (NIFC) */}
         {data?.perimeters ? (
-          <MapLibreGL.ShapeSource id="perimeters" shape={data.perimeters as any}>
-            <MapLibreGL.FillLayer
-              id="perim-fill"
-              style={{ fillColor: PERIM_COLOR, fillOpacity: 0.18 }}
-            />
-            <MapLibreGL.LineLayer
-              id="perim-line"
-              style={{ lineColor: PERIM_COLOR, lineWidth: 2 }}
-            />
-          </MapLibreGL.ShapeSource>
+          <GeoJSONSource id="perimeters" data={data.perimeters as any}>
+            <Layer id="perim-fill" type="fill" paint={{ "fill-color": PERIM_COLOR, "fill-opacity": 0.18 }} />
+            <Layer id="perim-line" type="line" paint={{ "line-color": PERIM_COLOR, "line-width": 2 }} />
+          </GeoJSONSource>
         ) : null}
 
         {/* Forecast isochrones (graduated by hour) */}
         {visibleIsochrones ? (
-          <MapLibreGL.ShapeSource id="isochrones" shape={visibleIsochrones as any}>
-            <MapLibreGL.FillLayer
+          <GeoJSONSource id="isochrones" data={visibleIsochrones as any}>
+            <Layer
               id="iso-fill"
-              style={{
-                fillColor: [
+              type="fill"
+              paint={{
+                "fill-color": [
                   "interpolate",
                   ["linear"],
                   ["get", "hours"],
-                  1,
-                  "#ffd08a",
-                  3,
-                  "#f08a3c",
-                  6,
-                  "#c0261a",
+                  1, "#ffd08a",
+                  3, "#f08a3c",
+                  6, "#c0261a",
                 ],
-                fillOpacity: 0.28,
+                "fill-opacity": 0.28,
               }}
-              belowLayerID="fires-circle"
             />
-            <MapLibreGL.LineLayer
+            <Layer
               id="iso-line"
-              style={{ lineColor: "#c0261a", lineWidth: 1, lineOpacity: 0.6 }}
+              type="line"
+              paint={{ "line-color": "#c0261a", "line-width": 1, "line-opacity": 0.6 }}
             />
-          </MapLibreGL.ShapeSource>
+          </GeoJSONSource>
         ) : null}
 
         {/* Satellite hotspots (NASA FIRMS), if configured */}
         {data?.hotspots ? (
-          <MapLibreGL.ShapeSource id="hotspots" shape={data.hotspots as any}>
-            <MapLibreGL.CircleLayer
+          <GeoJSONSource id="hotspots" data={data.hotspots as any}>
+            <Layer
               id="hotspots-circle"
-              style={{ circleRadius: 3, circleColor: "#ff3b30", circleOpacity: 0.7 }}
+              type="circle"
+              paint={{ "circle-radius": 3, "circle-color": "#ff3b30", "circle-opacity": 0.7 }}
             />
-          </MapLibreGL.ShapeSource>
+          </GeoJSONSource>
         ) : null}
 
-        {/* Active fire incident points */}
-        <MapLibreGL.ShapeSource
+        {/* Active fire incident points (declared last => drawn on top) */}
+        <GeoJSONSource
           id="fires"
-          shape={firePoints as any}
-          onPress={(e) => {
-            const id = e.features?.[0]?.properties?.id;
+          data={firePoints as any}
+          onPress={(e: any) => {
+            const id = e?.nativeEvent?.features?.[0]?.properties?.id;
             const fire = data?.fires.find((f) => f.id === id);
             if (fire) onSelectFire(fire);
           }}
         >
-          <MapLibreGL.CircleLayer
+          <Layer
             id="fires-circle"
-            style={{
-              circleRadius: 8,
-              circleColor: FIRE_COLOR,
-              circleStrokeColor: "#fff",
-              circleStrokeWidth: 2,
+            type="circle"
+            paint={{
+              "circle-radius": 8,
+              "circle-color": FIRE_COLOR,
+              "circle-stroke-color": "#fff",
+              "circle-stroke-width": 2,
             }}
           />
-        </MapLibreGL.ShapeSource>
-      </MapLibreGL.MapView>
+        </GeoJSONSource>
+      </Map>
 
       <SearchBar onSubmit={onSearch} onUseLocation={onUseLocation} loading={loading} />
 
