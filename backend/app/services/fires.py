@@ -256,6 +256,36 @@ async def all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[st
         return resp.json()
 
 
+async def perimeters_in_bbox(
+    west: float, south: float, east: float, north: float,
+    min_acres: float = 10.0, offset: float = 0.0, limit: int = 1500,
+) -> dict[str, Any]:
+    """
+    Current fire perimeters intersecting a lon/lat bounding box, as GeoJSON.
+    `offset` is maxAllowableOffset in degrees (0 = full resolution); the caller
+    sets it to about a pixel's worth so a zoomed-in view stays crisp while the
+    payload stays small.
+    """
+    params = {
+        "where": f"poly_GISAcres >= {min_acres}",
+        "geometry": f"{west},{south},{east},{north}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "OBJECTID,poly_IncidentName,poly_GISAcres",
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "resultRecordCount": limit,
+        "f": "geojson",
+    }
+    if offset and offset > 0:
+        params["maxAllowableOffset"] = str(offset)
+    async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        resp = await client.get(WFIGS_PERIMS_URL, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def nearest_perimeter_geometry(lat: float, lon: float, radius_km: float = 10.0) -> Optional[dict[str, Any]]:
     """Return the single closest perimeter polygon geometry, if any, for ignition."""
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:

@@ -125,17 +125,45 @@ async function loadAllFires(){
   } catch(e){ toast("Couldn't load fires: "+e.message); }
 }
 
+// Perimeters use "detail on demand": a fast, simplified nationwide base when
+// zoomed out, swapped for full-resolution viewport perimeters when zoomed in.
+let nationalPerims = null;
+const PERIM_ZOOM = 7.5;   // at/above this zoom, fetch crisp viewport perimeters
+
+function setPerimeters(fc){
+  setSource("perimeters", fc || {type:"FeatureCollection",features:[]}, [
+    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.25 } },
+    { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#8f2417","line-width":1.5 } },
+  ]);
+  if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
+}
+
 // Draw ALL current fire perimeters nationwide up front (no click needed).
 async function loadAllPerimeters(){
   try {
-    const fc = await jget("/perimeters/all?min_acres=100");
-    setSource("perimeters", fc || {type:"FeatureCollection",features:[]}, [
-      { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.25 } },
-      { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#8f2417","line-width":1.5 } },
-    ]);
-    if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
+    nationalPerims = await jget("/perimeters/all?min_acres=100");
+    setPerimeters(nationalPerims);
   } catch(e){ /* best-effort overlay */ }
 }
+
+// On pan/zoom: crisp viewport perimeters when zoomed in, national base when out.
+async function refreshPerimeters(){
+  if (map.getZoom() < PERIM_ZOOM){
+    if (nationalPerims && map.getSource("perimeters")) map.getSource("perimeters").setData(nationalPerims);
+    return;
+  }
+  const b = map.getBounds();
+  const w=b.getWest(), s=b.getSouth(), e=b.getEast(), n=b.getNorth();
+  // Simplify by ~1 pixel so detail matches the screen while payloads stay small.
+  const offset = Math.max(0, (e - w) / Math.max(1, map.getCanvas().clientWidth) * 1.2);
+  try {
+    const fc = await jget(`/perimeters/bbox?west=${w}&south=${s}&east=${e}&north=${n}&min_acres=10&offset=${offset}`);
+    if (map.getSource("perimeters")) map.getSource("perimeters").setData(fc);
+    if (map.getLayer("fires-dot")) map.moveLayer("fires-dot");
+  } catch(err){ /* keep whatever is currently shown */ }
+}
+
+function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
 
 async function search(){
   const v = document.getElementById("addr").value.trim(); if(!v) return;
@@ -231,6 +259,8 @@ document.getElementById("addr").addEventListener("keydown", e=>{ if(e.key==="Ent
 
 // Show all ongoing fires + all perimeters as soon as the map is ready.
 map.on("load", ()=>{ loadAllPerimeters(); loadAllFires(); });
+// Swap to crisp viewport perimeters when the user settles on a zoomed-in view.
+map.on("moveend", debounce(refreshPerimeters, 350));
 map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
   const f = fires.find(x=>String(x.id)===String(id)); if(f) openSheet(f); });
 map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");

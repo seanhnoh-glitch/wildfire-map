@@ -30,6 +30,22 @@ async def all_perimeters(
         raise HTTPException(status_code=502, detail=f"Perimeter data source error: {exc}")
 
 
+@router.get("/perimeters/bbox")
+async def perimeters_bbox(
+    west: float = Query(..., ge=-180, le=180),
+    south: float = Query(..., ge=-90, le=90),
+    east: float = Query(..., ge=-180, le=180),
+    north: float = Query(..., ge=-90, le=90),
+    min_acres: float = Query(10.0, ge=0),
+    offset: float = Query(0.0, ge=0, description="maxAllowableOffset in degrees; 0 = full res"),
+):
+    """Full-resolution perimeters within the current viewport, for crisp zoomed-in detail."""
+    try:
+        return await fires_svc.perimeters_in_bbox(west, south, east, north, min_acres=min_acres, offset=offset)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Perimeter data source error: {exc}")
+
+
 @router.get("/fires/nearby", response_model=NearbyFiresResponse)
 async def nearby_fires(
     lat: float = Query(..., ge=-90, le=90),
