@@ -187,6 +187,53 @@ async def nearby(lat: float, lon: float, radius_km: float) -> dict[str, Any]:
     return {"fires": points, "perimeters": perims, "hotspots": hotspots}
 
 
+async def all_active(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
+    """
+    All current US wildfire incidents at/above `min_acres`, nationwide (no spatial
+    filter) — for showing every ongoing fire on the map at once. Points only
+    (no perimeters/hotspots) to keep the payload light. distance_km is 0 here
+    since there is no reference point; the client computes distance if it has one.
+    """
+    params = {
+        "where": (
+            "IncidentTypeCategory = 'WF' AND FireOutDateTime IS NULL "
+            f"AND IncidentSize >= {min_acres}"
+        ),
+        "outFields": ",".join([
+            "OBJECTID", "IncidentName", "IncidentSize", "PercentContained",
+            "FireDiscoveryDateTime", "POOCounty", "POOState",
+        ]),
+        "orderByFields": "IncidentSize DESC",
+        "resultRecordCount": limit,
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "f": "geojson",
+    }
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        resp = await client.get(WFIGS_POINTS_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    fires: list[Fire] = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        geom = feat.get("geometry") or {}
+        coords = geom.get("coordinates") or [None, None]
+        f_lon, f_lat = coords[0], coords[1]
+        if f_lat is None or f_lon is None:
+            continue
+        fires.append(Fire(
+            id=str(props.get("OBJECTID") or f"{f_lat:.4f},{f_lon:.4f}"),
+            name=(props.get("IncidentName") or "Unnamed incident").strip(),
+            lat=f_lat, lon=f_lon, distance_km=0.0,
+            size_acres=props.get("IncidentSize"),
+            percent_contained=props.get("PercentContained"),
+            discovery_time=_iso(props.get("FireDiscoveryDateTime")),
+            county=props.get("POOCounty"), state=props.get("POOState"),
+        ))
+    return fires
+
+
 async def nearest_perimeter_geometry(lat: float, lon: float, radius_km: float = 10.0) -> Optional[dict[str, Any]]:
     """Return the single closest perimeter polygon geometry, if any, for ignition."""
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:

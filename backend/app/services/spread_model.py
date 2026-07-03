@@ -165,29 +165,31 @@ def simulate(
     }
 
 
-# --- Time-varying propagation (Huygens elliptical-wavelet approximation) ------
+# --- Time-varying propagation (robust anisotropic polygon growth) ------------
 #
 # The closed-form `simulate` above assumes ONE constant wind. To make a genuinely
-# time-evolving forecast that bends as the hourly wind shifts, we instead grow the
-# fire perimeter incrementally: at each step every point on the front advances
-# outward by that hour's local spread rate. The rate follows the elliptical polar
-# form (fastest downwind, slowest backing), which is the basis of Huygens-wavelet
-# fire growth (Anderson 1983; Richards 1990) used by simulators like FARSITE.
+# time-evolving forecast that bends as the hourly wind shifts, we grow the fire
+# footprint incrementally: at each hourly step we expand the current polygon by an
+# ELLIPTICAL structuring element (a Minkowski sum) sized from that hour's wind —
+# larger downwind, smaller backing, per the Alexander (1985) length-to-breadth
+# relation. This is the geometric equivalent of Huygens-wavelet fire growth
+# (Anderson 1983; Richards 1990) used by simulators like FARSITE, but computed
+# with robust polygon geometry (shapely). Unlike a vertex-by-vertex scheme it
+# never produces radial spikes on jagged real perimeters. Research tool, not
+# operational guidance.
 #
-# Simplification: the outward direction at each vertex is taken from the fire's
-# centroid (stable and self-intersection-resistant for the convex-ish fronts a
-# short forecast produces), rather than the exact local front normal. Good for a
-# research prototype; not operational guidance.
+# Anisotropic-growth trick: rotate the polygon so the wind blows along +x, scale x
+# so the target ellipse becomes a circle, buffer by that radius, undo the scale,
+# shift downwind by the focus offset, rotate back. Unioning with the previous step
+# keeps the isochrones strictly nested for the time slider.
 
-FRONT_POINTS = 180
-SEED_RADIUS_M = 30.0
+from shapely import affinity
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
 
-
-def _seed_front(n: int, radius_m: float) -> list[tuple[float, float]]:
-    return [
-        (radius_m * math.cos(2 * math.pi * k / n), radius_m * math.sin(2 * math.pi * k / n))
-        for k in range(n)
-    ]
+FRONT_POINTS = 180           # seed-circle resolution / reference
+SEED_RADIUS_M = 40.0         # point ignition starts as a small circle
+SIMPLIFY_TOLERANCE_M = 20.0  # keep vertex counts sane between steps
 
 
 def _ring_area(ring: list[list[float]]) -> float:
@@ -215,67 +217,60 @@ def _largest_ring(geometry: dict) -> Optional[list[list[float]]]:
     return None
 
 
-def perimeter_to_front(geometry: dict, n_points: int = FRONT_POINTS):
-    """
-    Turn a GeoJSON fire perimeter into an initial front for propagation.
+def _largest_part(geom):
+    """Return the largest Polygon part of a (possibly Multi) geometry."""
+    if geom.geom_type == "Polygon":
+        return geom
+    polys = [g for g in getattr(geom, "geoms", []) if g.geom_type == "Polygon"]
+    return max(polys, key=lambda g: g.area) if polys else geom
 
-    Returns (origin_lat, origin_lon, front_pts_meters) where the origin is the
-    perimeter centroid and the front is a star-shaped resampling to n_points
-    equally-spaced angles about that centroid. Star resampling both normalizes
-    vertex count and keeps the front compatible with the centroid-normal
-    propagator. Returns None if the geometry can't be used.
+
+def perimeter_to_polygon(geometry: dict):
+    """
+    Turn a GeoJSON fire perimeter into (origin_lat, origin_lon, polygon), where
+    `polygon` is a shapely Polygon in local meters about the perimeter centroid.
+    `buffer(0)` repairs minor self-intersections in the source data. Returns None
+    if the geometry can't be used.
     """
     ring = _largest_ring(geometry)
     if not ring or len(ring) < 3:
         return None
-
-    # Drop the closing duplicate vertex so it doesn't skew the centroid.
     verts = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
     if len(verts) < 3:
         return None
 
     origin_lon = sum(p[0] for p in verts) / len(verts)
     origin_lat = sum(p[1] for p in verts) / len(verts)
+    pts_m = [lonlat_to_local_meters(origin_lat, origin_lon, lon, lat) for lon, lat in verts]
 
-    # Vertices as (angle from centroid, radius in meters).
-    polar: list[tuple[float, float]] = []
-    for lon, lat in verts:
-        dx, dy = lonlat_to_local_meters(origin_lat, origin_lon, lon, lat)
-        r = math.hypot(dx, dy)
-        if r <= 0:
-            continue
-        polar.append((math.atan2(dy, dx) % (2 * math.pi), r))
-    if len(polar) < 3:
+    poly = Polygon(pts_m)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    poly = _largest_part(poly)
+    if poly.is_empty or poly.area <= 0:
         return None
-    polar.sort()
-
-    # Resample: for each target angle take the radius of the nearest source
-    # vertex by angle (robust for irregular, roughly star-shaped perimeters).
-    angles = [a for a, _ in polar]
-    radii = [r for _, r in polar]
-    front: list[tuple[float, float]] = []
-    for k in range(n_points):
-        target = 2 * math.pi * k / n_points
-        j = min(range(len(angles)), key=lambda i: abs(((angles[i] - target + math.pi) % (2 * math.pi)) - math.pi))
-        r = radii[j]
-        front.append((r * math.cos(target), r * math.sin(target)))
-    return origin_lat, origin_lon, front
+    return origin_lat, origin_lon, poly
 
 
-def _centroid(pts: list[tuple[float, float]]) -> tuple[float, float]:
-    n = len(pts)
-    return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
-
-
-def _polygon_area_m2(pts: list[tuple[float, float]]) -> float:
-    """Shoelace area of a ring given in meters."""
-    area = 0.0
-    n = len(pts)
-    for i in range(n):
-        x1, y1 = pts[i]
-        x2, y2 = pts[(i + 1) % n]
-        area += x1 * y2 - x2 * y1
-    return abs(area) / 2.0
+def _grow(poly, head_m: float, lb: float, toward_deg: float):
+    """
+    Expand `poly` by an elliptical structuring element (Minkowski sum) sized to
+    one step's spread: downwind reach `head_m`, elongation `lb`. See module notes.
+    """
+    e = math.sqrt(max(0.0, 1.0 - 1.0 / (lb * lb)))
+    a = head_m / (1.0 + e)          # semi-major (downwind reach = a*(1+e) = head_m)
+    if a <= 0:
+        return poly
+    b = a / lb                      # semi-minor (lateral)
+    c = a * e                       # focus offset (extra downwind shift)
+    theta = 90.0 - toward_deg       # math angle (CCW from +x) of the wind-toward dir
+    p = affinity.rotate(poly, -theta, origin=(0, 0), use_radians=False)  # wind -> +x
+    p = affinity.scale(p, xfact=b / a, yfact=1.0, origin=(0, 0))         # ellipse -> circle
+    p = p.buffer(b, quad_segs=24)                                        # round buffer
+    p = affinity.scale(p, xfact=a / b, yfact=1.0, origin=(0, 0))         # circle -> ellipse
+    p = affinity.translate(p, xoff=c)                                    # shift downwind
+    p = affinity.rotate(p, theta, origin=(0, 0), use_radians=False)      # back to map frame
+    return p
 
 
 def simulate_timevarying(
@@ -286,7 +281,7 @@ def simulate_timevarying(
     wind_factor: float,
     slope_percent: float,
     step_minutes: int,
-    initial_front: Optional[list[tuple[float, float]]] = None,
+    initial_polygon=None,
 ) -> dict[str, Any]:
     """
     Grow the fire step by step under a per-step wind series.
@@ -294,44 +289,40 @@ def simulate_timevarying(
     wind_series: one (wind_speed_kmh, wind_direction_deg_FROM) per step. Its
     length sets how many isochrones are produced.
 
-    initial_front: optional starting perimeter as (east,north) meters relative to
-    (lat,lon) — e.g. a real NIFC fire footprint from `perimeter_to_front`. When
+    initial_polygon: optional starting shapely Polygon in local meters about
+    (lat,lon) — e.g. a real NIFC footprint from `perimeter_to_polygon`. When
     omitted, the fire starts from a small seed circle (point ignition).
 
-    Returns the same GeoJSON FeatureCollection shape as `simulate` (one nested
-    polygon per step) so the mobile app renders both engines identically.
+    Returns a GeoJSON FeatureCollection with one strictly-nested polygon per step.
     """
-    front = list(initial_front) if initial_front else _seed_front(FRONT_POINTS, SEED_RADIUS_M)
+    if initial_polygon is not None:
+        poly = initial_polygon if initial_polygon.is_valid else initial_polygon.buffer(0)
+        poly = _largest_part(poly)
+    else:
+        poly = Point(0, 0).buffer(SEED_RADIUS_M, quad_segs=24)
+
     features: list[dict[str, Any]] = []
     minutes = 0
 
     for step_idx, (speed, dir_from) in enumerate(wind_series, start=1):
         minutes += step_minutes
         toward = wind_from_to_toward_bearing(dir_from)
-        toward_rad = bearing_to_math_radians(toward)
-        wx, wy = math.cos(toward_rad), math.sin(toward_rad)  # unit wind-toward (east, north)
-
         lb = length_to_breadth(speed)
-        e = math.sqrt(max(0.0, 1.0 - 1.0 / (lb * lb)))
         head_rate = head_ros_m_per_min(ros_ref, wind_factor, speed, slope_percent)  # m/min
+        head_m = head_rate * step_minutes
 
-        cx, cy = _centroid(front)
-        new_front: list[tuple[float, float]] = []
-        for px, py in front:
-            nx, ny = px - cx, py - cy
-            norm = math.hypot(nx, ny) or 1.0
-            nx, ny = nx / norm, ny / norm  # outward direction from centroid
-            cos_phi = nx * wx + ny * wy    # alignment with wind-toward
-            # Elliptical polar rate: head_rate downwind, (1-e)/(1+e)*head backing.
-            rate = head_rate * (1.0 - e) / (1.0 - e * cos_phi)
-            disp = rate * step_minutes     # meters advanced this step
-            new_front.append((px + nx * disp, py + ny * disp))
-        front = new_front
+        grown = _grow(poly, head_m, lb, toward)
+        poly = unary_union([poly, grown])      # union keeps steps strictly nested
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        poly = _largest_part(poly)
+        poly = poly.simplify(SIMPLIFY_TOLERANCE_M, preserve_topology=True)
 
-        # Head distance = farthest projection of the front onto the wind-toward axis.
-        head_m = max(px * wx + py * wy for px, py in front)
-        ring = [list(local_meters_to_lonlat(lat, lon, px, py)) for px, py in front]
-        ring.append(ring[0])  # close
+        toward_rad = bearing_to_math_radians(toward)
+        wx, wy = math.cos(toward_rad), math.sin(toward_rad)
+        ext = list(poly.exterior.coords)
+        head_dist = max(px * wx + py * wy for px, py in ext)
+        ring = [list(local_meters_to_lonlat(lat, lon, px, py)) for px, py in ext]
         features.append({
             "type": "Feature",
             "geometry": {"type": "Polygon", "coordinates": [ring]},
@@ -339,8 +330,8 @@ def simulate_timevarying(
                 "step": step_idx,
                 "minutes": minutes,
                 "hours": round(minutes / 60.0, 2),
-                "head_distance_km": round(head_m / 1000.0, 3),
-                "area_km2": round(_polygon_area_m2(front) / 1_000_000.0, 3),
+                "head_distance_km": round(head_dist / 1000.0, 3),
+                "area_km2": round(poly.area / 1_000_000.0, 3),
                 "wind_speed_kmh": round(speed, 1),
                 "wind_from_deg": round(dir_from, 1),
             },
@@ -350,8 +341,8 @@ def simulate_timevarying(
         "type": "FeatureCollection",
         "features": features,
         "properties": {
-            "model": "huygens-elliptical-timevarying",
+            "model": "anisotropic-minkowski-timevarying",
             "steps": len(features),
-            "seeded_from_perimeter": initial_front is not None,
+            "seeded_from_perimeter": initial_polygon is not None,
         },
     }

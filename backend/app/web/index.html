@@ -86,7 +86,11 @@ const STYLE = {
 const map = new maplibregl.Map({ container:"map", style:STYLE, center:[-119.4,37.5], zoom:5.2 });
 map.addControl(new maplibregl.NavigationControl({ showCompass:false }), "bottom-right");
 
-let fires = [], selected = null, prediction = null;
+let fires = [], selected = null, prediction = null, origin = null, animTimer = null;
+function haversineKm(la1, lo1, la2, lo2){ const R=6371, r=Math.PI/180;
+  const dLa=(la2-la1)*r, dLo=(lo2-lo1)*r;
+  const s=Math.sin(dLa/2)**2 + Math.cos(la1*r)*Math.cos(la2*r)*Math.sin(dLo/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s)); }
 
 function toast(msg, ms=2600){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(t._t); if(ms) t._t=setTimeout(()=>t.classList.remove("show"), ms); }
@@ -102,33 +106,39 @@ function setSource(id, data, layers){
   layers.forEach(l => { if(!map.getLayer(l.id)) map.addLayer(l); });
 }
 
-function drawFires(res){
-  fires = res.fires || [];
-  // Perimeters (draw first = underneath)
-  setSource("perimeters", res.perimeters || {type:"FeatureCollection",features:[]}, [
-    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.18 } },
-    { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#b5321f","line-width":2 } },
-  ]);
-  // Hotspots
-  setSource("hotspots", res.hotspots || {type:"FeatureCollection",features:[]}, [
-    { id:"hotspots-dot", type:"circle", source:"hotspots",
-      paint:{ "circle-radius":3,"circle-color":"#ff3b30","circle-opacity":0.7 } },
-  ]);
-  // Fire incident points (on top)
+function drawFirePoints(){
   const pts = { type:"FeatureCollection", features: fires.map(f => ({
     type:"Feature", properties:{ id:f.id, name:f.name }, geometry:{ type:"Point", coordinates:[f.lon,f.lat] } })) };
   setSource("fires", pts, [
     { id:"fires-dot", type:"circle", source:"fires",
-      paint:{ "circle-radius":8,"circle-color":"#d85a30","circle-stroke-color":"#fff","circle-stroke-width":2 } },
+      paint:{ "circle-radius":6,"circle-color":"#d85a30","circle-stroke-color":"#fff","circle-stroke-width":1.5 } },
   ]);
-  if (!fires.length) toast("No active wildfires within 120 km.");
-  else toast(fires.length + " active fire(s) nearby — tap a dot.");
 }
 
-async function loadFires(lat, lon){
-  toast("Checking fires…", 0);
-  try { const res = await jget(`/fires/nearby?lat=${lat}&lon=${lon}&radius_km=120`); drawFires(res); }
-  catch(e){ toast("Couldn't load fires: "+e.message); }
+// Load EVERY ongoing US wildfire and show them all on the map (largest first).
+async function loadAllFires(){
+  toast("Loading active wildfires…", 0);
+  try {
+    fires = await jget("/fires/all?min_acres=50&limit=2000");
+    drawFirePoints();
+    toast(fires.length + " active wildfires nationwide — tap any dot, or search your area.");
+  } catch(e){ toast("Couldn't load fires: "+e.message); }
+}
+
+// Perimeters + hotspots around a point (a searched area, or a tapped fire).
+async function loadContext(lat, lon, radiusKm=60){
+  try {
+    const res = await jget(`/fires/nearby?lat=${lat}&lon=${lon}&radius_km=${radiusKm}`);
+    setSource("perimeters", res.perimeters || {type:"FeatureCollection",features:[]}, [
+      { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.18 } },
+      { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#b5321f","line-width":2 } },
+    ]);
+    setSource("hotspots", res.hotspots || {type:"FeatureCollection",features:[]}, [
+      { id:"hotspots-dot", type:"circle", source:"hotspots",
+        paint:{ "circle-radius":3,"circle-color":"#ff3b30","circle-opacity":0.7 } },
+    ]);
+    if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
+  } catch(e){ /* context is best-effort */ }
 }
 
 async function search(){
@@ -136,8 +146,10 @@ async function search(){
   toast("Finding address…", 0);
   try {
     const g = await jget(`/geocode?address=${encodeURIComponent(v)}`);
-    map.flyTo({ center:[g.lon,g.lat], zoom:9 });
-    await loadFires(g.lat, g.lon);
+    origin = { lat:g.lat, lon:g.lon };
+    map.flyTo({ center:[g.lon,g.lat], zoom:8 });
+    loadContext(g.lat, g.lon, 120);
+    toast("Showing your area — tap a fire dot to forecast its spread.");
   } catch(e){ toast("Address not found. Try 'City, ST'."); }
 }
 
@@ -145,12 +157,17 @@ async function search(){
 const sheet = document.getElementById("sheet");
 function openSheet(f){
   selected = f; prediction = null;
+  clearInterval(animTimer); animTimer = null;
+  ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
+  document.getElementById("legend").classList.remove("show");
   document.getElementById("fName").textContent = "🔥 " + f.name;
-  document.getElementById("fMeta").textContent =
-    `${f.distance_km.toFixed(1)} km away` +
-    (f.size_acres!=null ? ` · ${Number(f.size_acres).toLocaleString()} acres` : "") +
-    (f.percent_contained!=null ? ` · ${f.percent_contained}% contained` : "");
+  const parts = [];
+  if (origin) parts.push(`${haversineKm(origin.lat, origin.lon, f.lat, f.lon).toFixed(1)} km away`);
+  if (f.size_acres != null) parts.push(`${Number(f.size_acres).toLocaleString()} acres`);
+  if (f.percent_contained != null) parts.push(`${f.percent_contained}% contained`);
+  document.getElementById("fMeta").textContent = parts.join(" · ");
   document.getElementById("fSub").textContent = [f.county, f.state].filter(Boolean).join(", ");
+  loadContext(f.lat, f.lon, 40);  // show this fire's mapped footprint
   document.getElementById("fc").style.display = "none";
   document.getElementById("predictBtn").style.display = "block";
   document.getElementById("predictBtn").disabled = false;
@@ -185,10 +202,10 @@ async function runForecast(){
       `engine: ${prediction.engine} · ignition: ${p.ignition} · fuel ${p.fuel_model} · ` +
       `wind ${Math.round(p.wind_speed_kmh)}→${Math.round(p.wind_end_speed_kmh)} km/h`;
     const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
-    applyHour(maxH);
     document.getElementById("fc").style.display = "block";
     document.getElementById("predictBtn").style.display = "none";
     document.getElementById("legend").classList.add("show");
+    animateForecast(maxH);   // sweep from 0h up to the full horizon
   } catch(e){ toast("Forecast failed: "+e.message); btn.disabled=false; btn.textContent="Forecast spread →"; }
 }
 function applyHour(h){
@@ -197,13 +214,26 @@ function applyHour(h){
   if(map.getLayer("iso-fill")) map.setFilter("iso-fill", f);
   if(map.getLayer("iso-line")) map.setFilter("iso-line", f);
 }
+// Animate the spread reveal: start at 0h (nothing), step up to maxH once.
+function animateForecast(maxH){
+  clearInterval(animTimer);
+  applyHour(0);
+  let h = 0;
+  animTimer = setInterval(()=>{
+    h += 1;
+    document.getElementById("hour").value = String(h);
+    applyHour(h);
+    if (h >= maxH) { clearInterval(animTimer); animTimer = null; }
+  }, 650);
+}
 
 document.getElementById("predictBtn").onclick = runForecast;
-document.getElementById("hour").oninput = (e)=> applyHour(Number(e.target.value));
+// Dragging the slider takes over from the animation.
+document.getElementById("hour").oninput = (e)=>{ clearInterval(animTimer); animTimer=null; applyHour(Number(e.target.value)); };
 document.getElementById("addr").addEventListener("keydown", e=>{ if(e.key==="Enter") search(); });
 
-// Tap a fire dot
-map.on("load", ()=>{ toast("Search an address to see fires near you.", 3500); });
+// Show all ongoing fires as soon as the map is ready.
+map.on("load", ()=>{ loadAllFires(); });
 map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
   const f = fires.find(x=>String(x.id)===String(id)); if(f) openSheet(f); });
 map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");
@@ -215,8 +245,9 @@ document.getElementById("locate").onclick = ()=>{
   if(!navigator.geolocation){ toast("Geolocation unavailable — type an address."); return; }
   toast("Getting your location…", 0);
   navigator.geolocation.getCurrentPosition(
-    p=>{ map.flyTo({center:[p.coords.longitude,p.coords.latitude],zoom:9});
-         loadFires(p.coords.latitude, p.coords.longitude); },
+    p=>{ origin={lat:p.coords.latitude, lon:p.coords.longitude};
+         map.flyTo({center:[p.coords.longitude,p.coords.latitude],zoom:8});
+         loadContext(p.coords.latitude, p.coords.longitude, 120); },
     ()=> toast("Location blocked (needs https on a phone) — type an address instead."),
     { enableHighAccuracy:false, timeout:12000 }
   );

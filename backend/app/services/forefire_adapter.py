@@ -114,14 +114,14 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
     # Ignition: start from the real mapped fire footprint when one exists, so a
     # large fire's forecast grows from its actual perimeter rather than a point.
     origin_lat, origin_lon = req.lat, req.lon
-    initial_front = None
+    initial_polygon = None
     ignition = "point"
     if req.ignite_from_perimeter:
         try:
             geom = await fires_svc.nearest_perimeter_geometry(req.lat, req.lon, radius_km=8.0)
-            parsed = spread_model.perimeter_to_front(geom) if geom else None
+            parsed = spread_model.perimeter_to_polygon(geom) if geom else None
             if parsed:
-                origin_lat, origin_lon, initial_front = parsed
+                origin_lat, origin_lon, initial_polygon = parsed
                 ignition = "perimeter"
                 notes.append("Ignited from mapped NIFC perimeter (fire's current footprint).")
             else:
@@ -136,7 +136,7 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
         "slope_percent": float(slope),
         "origin_lat": origin_lat,
         "origin_lon": origin_lon,
-        "initial_front": initial_front,
+        "initial_polygon": initial_polygon,
         "ignition": ignition,
         "notes": notes,
     }
@@ -187,7 +187,7 @@ async def predict(req: PredictRequest) -> PredictResponse:
         wind_factor=inputs["fuel"]["wind_factor"],
         slope_percent=inputs["slope_percent"],
         step_minutes=req.step_minutes,
-        initial_front=inputs["initial_front"],
+        initial_polygon=inputs["initial_polygon"],
     )
     notes.append(
         f"Built-in time-varying elliptical model ({fc['properties']['steps']} steps, "

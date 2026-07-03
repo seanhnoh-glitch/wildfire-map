@@ -117,39 +117,37 @@ def _square_polygon(clat, clon, half_deg):
     return {"type": "Polygon", "coordinates": [ring]}
 
 
-def test_perimeter_to_front_centroid_and_count():
+def test_perimeter_to_polygon_centroid_and_area():
     geom = _square_polygon(34.0, -118.0, 0.02)
-    parsed = sm.perimeter_to_front(geom, n_points=120)
+    parsed = sm.perimeter_to_polygon(geom)
     assert parsed is not None
-    olat, olon, front = parsed
-    assert abs(olat - 34.0) < 1e-6 and abs(olon - (-118.0)) < 1e-6
-    assert len(front) == 120
-    # Star radius should be on the order of the square's ~2 km half-size.
-    radii = [math.hypot(x, y) for x, y in front]
-    assert 1500 < max(radii) < 3500
+    olat, olon, poly = parsed
+    assert abs(olat - 34.0) < 1e-6 and abs(olon + 118.0) < 1e-6
+    # 0.04deg span -> ~4.4 km NS x ~3.7 km EW -> ~16 km^2.
+    assert 10 < poly.area / 1e6 < 25
 
 
 def test_perimeter_multipolygon_picks_largest():
     small = _square_polygon(34.0, -118.0, 0.005)["coordinates"]
     big = _square_polygon(34.0, -118.0, 0.03)["coordinates"]
     geom = {"type": "MultiPolygon", "coordinates": [small, big]}
-    parsed = sm.perimeter_to_front(geom, n_points=60)
+    parsed = sm.perimeter_to_polygon(geom)
     assert parsed is not None
-    _, _, front = parsed
-    assert max(math.hypot(x, y) for x, y in front) > 2500  # chose the big one
+    _, _, poly = parsed
+    assert poly.area / 1e6 > 20  # chose the big square (~37 km^2), not the small (~1)
 
 
 def test_perimeter_seeded_starts_large_and_grows():
     geom = _square_polygon(34.0, -118.0, 0.02)
-    _, _, front0 = sm.perimeter_to_front(geom, n_points=FRONT if (FRONT := sm.FRONT_POINTS) else 180)
+    _, _, poly0 = sm.perimeter_to_polygon(geom)
     series = [(20.0, 270.0)] * 4
     peri = sm.simulate_timevarying(
         lat=34.0, lon=-118.0, wind_series=series, ros_ref=9.0, wind_factor=1.1,
-        slope_percent=0, step_minutes=60, initial_front=front0,
+        slope_percent=0, step_minutes=60, initial_polygon=poly0,
     )
     pt = sm.simulate_timevarying(
         lat=34.0, lon=-118.0, wind_series=series, ros_ref=9.0, wind_factor=1.1,
-        slope_percent=0, step_minutes=60, initial_front=None,
+        slope_percent=0, step_minutes=60,
     )
     peri_areas = [f["properties"]["area_km2"] for f in peri["features"]]
     assert peri_areas == sorted(peri_areas)                      # grows
@@ -157,8 +155,34 @@ def test_perimeter_seeded_starts_large_and_grows():
     assert pt["properties"]["seeded_from_perimeter"] is False
     # Starting from a real footprint yields a larger burned area than a point.
     assert peri_areas[-1] > pt["features"][-1]["properties"]["area_km2"]
-    # And the first isochrone already covers roughly the footprint (~ (2*2.2km)^2).
-    assert peri_areas[0] > 5.0
+    assert peri_areas[0] > 10.0                                  # already covers the footprint
+
+
+def test_no_spikes_from_jagged_perimeter():
+    # A star-shaped (very non-convex) perimeter must not blow up into thin spikes:
+    # the grown footprint's area stays within a sane multiple of a convex hull proxy.
+    import math as _m
+    clat, clon, R = 39.0, -111.5, 0.05
+    ring = []
+    for k in range(24):
+        ang = 2 * _m.pi * k / 24
+        r = R if k % 2 == 0 else R * 0.35            # alternating spikes inward
+        ring.append([clon + r * _m.cos(ang), clat + r * _m.sin(ang)])
+    ring.append(ring[0])
+    geom = {"type": "Polygon", "coordinates": [ring]}
+    _, _, poly0 = sm.perimeter_to_polygon(geom)
+    series = [(30.0, 270.0)] * 6
+    fc = sm.simulate_timevarying(
+        lat=clat, lon=clon, wind_series=series, ros_ref=9.0, wind_factor=1.1,
+        slope_percent=0, step_minutes=60, initial_polygon=poly0,
+    )
+    from shapely.geometry import Polygon as _P
+    for f in fc["features"]:
+        ringc = f["geometry"]["coordinates"][0]
+        p = _P(ringc)
+        # A spiky polygon has area far smaller than its convex hull; require the
+        # footprint to fill most of its hull (compact, no thin spokes).
+        assert p.area > 0.55 * p.convex_hull.area
 
 
 def test_timevarying_calm_is_roughly_round():
