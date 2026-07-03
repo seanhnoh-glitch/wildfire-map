@@ -18,6 +18,18 @@ async def all_fires(
         raise HTTPException(status_code=502, detail=f"Fire data source error: {exc}")
 
 
+@router.get("/perimeters/all")
+async def all_perimeters(
+    min_acres: float = Query(100.0, ge=0, description="Only perimeters at/above this size"),
+    limit: int = Query(1500, gt=0, le=3000),
+):
+    """All current US fire perimeters (simplified) as a GeoJSON FeatureCollection."""
+    try:
+        return await fires_svc.all_perimeters(min_acres=min_acres, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Perimeter data source error: {exc}")
+
+
 @router.get("/fires/nearby", response_model=NearbyFiresResponse)
 async def nearby_fires(
     lat: float = Query(..., ge=-90, le=90),

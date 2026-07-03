@@ -234,6 +234,28 @@ async def all_active(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
     return fires
 
 
+async def all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
+    """
+    All current US fire perimeters at/above `min_acres`, nationwide, as a GeoJSON
+    FeatureCollection — for drawing every mapped footprint on the overview map.
+    Geometry is simplified server-side (maxAllowableOffset) to keep the payload
+    reasonable; small fires usually have no mapped perimeter anyway.
+    """
+    params = {
+        "where": f"poly_GISAcres >= {min_acres}",
+        "outFields": "OBJECTID,poly_IncidentName,poly_GISAcres",
+        "returnGeometry": "true",
+        "maxAllowableOffset": "0.005",   # ~500 m simplification (degrees at 4326)
+        "outSR": "4326",
+        "resultRecordCount": limit,
+        "f": "geojson",
+    }
+    async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        resp = await client.get(WFIGS_PERIMS_URL, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def nearest_perimeter_geometry(lat: float, lon: float, radius_km: float = 10.0) -> Optional[dict[str, Any]]:
     """Return the single closest perimeter polygon geometry, if any, for ignition."""
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:

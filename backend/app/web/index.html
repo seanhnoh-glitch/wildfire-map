@@ -125,20 +125,16 @@ async function loadAllFires(){
   } catch(e){ toast("Couldn't load fires: "+e.message); }
 }
 
-// Perimeters + hotspots around a point (a searched area, or a tapped fire).
-async function loadContext(lat, lon, radiusKm=60){
+// Draw ALL current fire perimeters nationwide up front (no click needed).
+async function loadAllPerimeters(){
   try {
-    const res = await jget(`/fires/nearby?lat=${lat}&lon=${lon}&radius_km=${radiusKm}`);
-    setSource("perimeters", res.perimeters || {type:"FeatureCollection",features:[]}, [
-      { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.18 } },
-      { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#b5321f","line-width":2 } },
-    ]);
-    setSource("hotspots", res.hotspots || {type:"FeatureCollection",features:[]}, [
-      { id:"hotspots-dot", type:"circle", source:"hotspots",
-        paint:{ "circle-radius":3,"circle-color":"#ff3b30","circle-opacity":0.7 } },
+    const fc = await jget("/perimeters/all?min_acres=100");
+    setSource("perimeters", fc || {type:"FeatureCollection",features:[]}, [
+      { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.25 } },
+      { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#8f2417","line-width":1.5 } },
     ]);
     if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
-  } catch(e){ /* context is best-effort */ }
+  } catch(e){ /* best-effort overlay */ }
 }
 
 async function search(){
@@ -148,7 +144,6 @@ async function search(){
     const g = await jget(`/geocode?address=${encodeURIComponent(v)}`);
     origin = { lat:g.lat, lon:g.lon };
     map.flyTo({ center:[g.lon,g.lat], zoom:8 });
-    loadContext(g.lat, g.lon, 120);
     toast("Showing your area — tap a fire dot to forecast its spread.");
   } catch(e){ toast("Address not found. Try 'City, ST'."); }
 }
@@ -167,7 +162,6 @@ function openSheet(f){
   if (f.percent_contained != null) parts.push(`${f.percent_contained}% contained`);
   document.getElementById("fMeta").textContent = parts.join(" · ");
   document.getElementById("fSub").textContent = [f.county, f.state].filter(Boolean).join(", ");
-  loadContext(f.lat, f.lon, 40);  // show this fire's mapped footprint
   document.getElementById("fc").style.display = "none";
   document.getElementById("predictBtn").style.display = "block";
   document.getElementById("predictBtn").disabled = false;
@@ -176,6 +170,7 @@ function openSheet(f){
   map.flyTo({ center:[f.lon,f.lat], zoom:11 });
 }
 function closeSheet(){ sheet.classList.remove("show"); selected=null;
+  clearInterval(animTimer); animTimer=null;
   document.getElementById("legend").classList.remove("show");
   ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); }); }
 
@@ -214,17 +209,19 @@ function applyHour(h){
   if(map.getLayer("iso-fill")) map.setFilter("iso-fill", f);
   if(map.getLayer("iso-line")) map.setFilter("iso-line", f);
 }
-// Animate the spread reveal: start at 0h (nothing), step up to maxH once.
+// Animate the spread reveal, LOOPING: 0h (empty) -> grow to maxH -> brief hold -> repeat.
 function animateForecast(maxH){
   clearInterval(animTimer);
-  applyHour(0);
-  let h = 0;
-  animTimer = setInterval(()=>{
-    h += 1;
-    document.getElementById("hour").value = String(h);
+  const cycle = maxH + 2;                 // frame 0 empty, 1..maxH grow, +1 hold at full
+  let f = 0;
+  const tick = ()=>{
+    const h = Math.min(f, maxH);
     applyHour(h);
-    if (h >= maxH) { clearInterval(animTimer); animTimer = null; }
-  }, 650);
+    document.getElementById("hour").value = String(Math.max(1, h));
+    f = (f + 1) % cycle;
+  };
+  tick();
+  animTimer = setInterval(tick, 650);
 }
 
 document.getElementById("predictBtn").onclick = runForecast;
@@ -232,8 +229,8 @@ document.getElementById("predictBtn").onclick = runForecast;
 document.getElementById("hour").oninput = (e)=>{ clearInterval(animTimer); animTimer=null; applyHour(Number(e.target.value)); };
 document.getElementById("addr").addEventListener("keydown", e=>{ if(e.key==="Enter") search(); });
 
-// Show all ongoing fires as soon as the map is ready.
-map.on("load", ()=>{ loadAllFires(); });
+// Show all ongoing fires + all perimeters as soon as the map is ready.
+map.on("load", ()=>{ loadAllPerimeters(); loadAllFires(); });
 map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
   const f = fires.find(x=>String(x.id)===String(id)); if(f) openSheet(f); });
 map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");
@@ -246,8 +243,7 @@ document.getElementById("locate").onclick = ()=>{
   toast("Getting your location…", 0);
   navigator.geolocation.getCurrentPosition(
     p=>{ origin={lat:p.coords.latitude, lon:p.coords.longitude};
-         map.flyTo({center:[p.coords.longitude,p.coords.latitude],zoom:8});
-         loadContext(p.coords.latitude, p.coords.longitude, 120); },
+         map.flyTo({center:[p.coords.longitude,p.coords.latitude],zoom:8}); },
     ()=> toast("Location blocked (needs https on a phone) — type an address instead."),
     { enableHighAccuracy:false, timeout:12000 }
   );
