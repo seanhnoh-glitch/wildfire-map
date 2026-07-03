@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wildfire Map</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root { --fire:#d85a30; --perim:#b5321f; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif; }
+  #map { position:absolute; inset:0; }
+  .search { position:absolute; top:calc(env(safe-area-inset-top) + 10px); left:10px; right:10px; z-index:5; display:flex; gap:8px; }
+  .search input { flex:1; border:0; border-radius:12px; padding:13px 14px; font-size:16px;
+    box-shadow:0 2px 10px rgba(0,0,0,.18); }
+  .search button { border:0; border-radius:12px; background:#fff; width:48px; font-size:20px;
+    color:var(--fire); box-shadow:0 2px 10px rgba(0,0,0,.18); }
+  .toast { position:absolute; top:calc(env(safe-area-inset-top) + 66px); left:10px; right:10px; z-index:5;
+    background:#1c1c1a; color:#fff; font-size:13px; padding:9px 12px; border-radius:10px; opacity:0;
+    transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:.92; }
+  .sheet { position:absolute; left:0; right:0; bottom:0; z-index:6; background:#fff;
+    border-radius:20px 20px 0 0; padding:16px 18px calc(env(safe-area-inset-bottom) + 20px);
+    box-shadow:0 -3px 20px rgba(0,0,0,.2); transform:translateY(110%); transition:transform .25s; }
+  .sheet.show { transform:translateY(0); }
+  .grip { width:40px; height:4px; background:#ddd; border-radius:2px; margin:0 auto 12px; }
+  .sheet h2 { margin:0 0 4px; font-size:18px; }
+  .meta { color:#333; font-size:14px; } .sub { color:#888; font-size:12px; margin-top:2px; }
+  .x { position:absolute; top:14px; right:16px; font-size:18px; color:#aaa; }
+  .btn { margin-top:14px; width:100%; border:0; border-radius:12px; background:var(--fire); color:#fff;
+    font-size:16px; font-weight:600; padding:13px; }
+  .btn[disabled] { opacity:.6; }
+  .fc { margin-top:14px; }
+  .fc .lab { font-size:12px; color:#666; }
+  .fc input[type=range] { width:100%; margin-top:10px; accent-color:var(--fire); }
+  .hourrow { display:flex; justify-content:space-between; align-items:center; margin-top:6px; }
+  .hourrow b { font-size:20px; } .disc { font-size:11px; color:#999; margin-top:10px; }
+  .legend { position:absolute; left:10px; bottom:10px; z-index:4; background:rgba(255,255,255,.9);
+    border-radius:10px; padding:8px 10px; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.15); display:none; }
+  .legend.show { display:block; } .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:5px; vertical-align:-2px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="search">
+  <input id="addr" type="text" inputmode="search" enterkeyhint="search"
+         placeholder="Enter a US address or city" autocapitalize="words" autocomplete="off">
+  <button id="locate" title="Use my location">◎</button>
+</div>
+<div id="toast" class="toast"></div>
+
+<div class="legend" id="legend">
+  <div><i style="background:#ffd08a"></i>+1h &nbsp; <i style="background:#f08a3c"></i>+3h &nbsp; <i style="background:#c0261a"></i>+6h</div>
+  <div style="margin-top:4px"><i style="background:#b5321f;opacity:.35"></i>current fire footprint</div>
+</div>
+
+<div id="sheet" class="sheet">
+  <div class="grip"></div>
+  <span class="x" id="closeSheet">✕</span>
+  <h2 id="fName">Fire</h2>
+  <div class="meta" id="fMeta"></div>
+  <div class="sub" id="fSub"></div>
+  <button class="btn" id="predictBtn">Forecast spread →</button>
+  <div class="fc" id="fc" style="display:none">
+    <div class="lab" id="fcInfo"></div>
+    <div class="hourrow"><span class="lab">Forecast horizon</span><b id="hourLabel">+6h</b></div>
+    <input id="hour" type="range" min="1" max="6" step="1" value="6">
+    <div class="disc">Research estimate — wind-, fuel-, and terrain-driven elliptical model. Not operational guidance.</div>
+  </div>
+</div>
+
+<script>
+// Served from the backend, so the API is same-origin — no config, no CORS.
+const API = window.location.origin;
+
+// Keyless OSM raster base map (dev/prototype use).
+const STYLE = {
+  version: 8,
+  sources: { osm: { type:"raster", tiles:["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize:256,
+    attribution:"© OpenStreetMap" } },
+  layers: [{ id:"osm", type:"raster", source:"osm" }]
+};
+
+const map = new maplibregl.Map({ container:"map", style:STYLE, center:[-119.4,37.5], zoom:5.2 });
+map.addControl(new maplibregl.NavigationControl({ showCompass:false }), "bottom-right");
+
+let fires = [], selected = null, prediction = null;
+
+function toast(msg, ms=2600){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show");
+  clearTimeout(t._t); if(ms) t._t=setTimeout(()=>t.classList.remove("show"), ms); }
+function hideToast(){ document.getElementById("toast").classList.remove("show"); }
+
+async function jget(path){ const r=await fetch(API+path); if(!r.ok) throw new Error((await r.text()).slice(0,140)); return r.json(); }
+async function jpost(path, body){ const r=await fetch(API+path,{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(body)}); if(!r.ok) throw new Error((await r.text()).slice(0,140)); return r.json(); }
+
+function setSource(id, data, layers){
+  if (map.getSource(id)) { map.getSource(id).setData(data); return; }
+  map.addSource(id, { type:"geojson", data });
+  layers.forEach(l => { if(!map.getLayer(l.id)) map.addLayer(l); });
+}
+
+function drawFires(res){
+  fires = res.fires || [];
+  // Perimeters (draw first = underneath)
+  setSource("perimeters", res.perimeters || {type:"FeatureCollection",features:[]}, [
+    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.18 } },
+    { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#b5321f","line-width":2 } },
+  ]);
+  // Hotspots
+  setSource("hotspots", res.hotspots || {type:"FeatureCollection",features:[]}, [
+    { id:"hotspots-dot", type:"circle", source:"hotspots",
+      paint:{ "circle-radius":3,"circle-color":"#ff3b30","circle-opacity":0.7 } },
+  ]);
+  // Fire incident points (on top)
+  const pts = { type:"FeatureCollection", features: fires.map(f => ({
+    type:"Feature", properties:{ id:f.id, name:f.name }, geometry:{ type:"Point", coordinates:[f.lon,f.lat] } })) };
+  setSource("fires", pts, [
+    { id:"fires-dot", type:"circle", source:"fires",
+      paint:{ "circle-radius":8,"circle-color":"#d85a30","circle-stroke-color":"#fff","circle-stroke-width":2 } },
+  ]);
+  if (!fires.length) toast("No active wildfires within 120 km.");
+  else toast(fires.length + " active fire(s) nearby — tap a dot.");
+}
+
+async function loadFires(lat, lon){
+  toast("Checking fires…", 0);
+  try { const res = await jget(`/fires/nearby?lat=${lat}&lon=${lon}&radius_km=120`); drawFires(res); }
+  catch(e){ toast("Couldn't load fires: "+e.message); }
+}
+
+async function search(){
+  const v = document.getElementById("addr").value.trim(); if(!v) return;
+  toast("Finding address…", 0);
+  try {
+    const g = await jget(`/geocode?address=${encodeURIComponent(v)}`);
+    map.flyTo({ center:[g.lon,g.lat], zoom:9 });
+    await loadFires(g.lat, g.lon);
+  } catch(e){ toast("Address not found. Try 'City, ST'."); }
+}
+
+// --- Fire selection + forecast ---
+const sheet = document.getElementById("sheet");
+function openSheet(f){
+  selected = f; prediction = null;
+  document.getElementById("fName").textContent = "🔥 " + f.name;
+  document.getElementById("fMeta").textContent =
+    `${f.distance_km.toFixed(1)} km away` +
+    (f.size_acres!=null ? ` · ${Number(f.size_acres).toLocaleString()} acres` : "") +
+    (f.percent_contained!=null ? ` · ${f.percent_contained}% contained` : "");
+  document.getElementById("fSub").textContent = [f.county, f.state].filter(Boolean).join(", ");
+  document.getElementById("fc").style.display = "none";
+  document.getElementById("predictBtn").style.display = "block";
+  document.getElementById("predictBtn").disabled = false;
+  document.getElementById("predictBtn").textContent = "Forecast spread →";
+  sheet.classList.add("show");
+  map.flyTo({ center:[f.lon,f.lat], zoom:11 });
+}
+function closeSheet(){ sheet.classList.remove("show"); selected=null;
+  document.getElementById("legend").classList.remove("show");
+  ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); }); }
+
+document.getElementById("closeSheet").onclick = closeSheet;
+
+async function runForecast(){
+  if(!selected) return;
+  const btn = document.getElementById("predictBtn"); btn.disabled = true; btn.textContent = "Forecasting…";
+  try {
+    prediction = await jpost("/predict", { lat:selected.lat, lon:selected.lon, duration_hours:6, step_minutes:60 });
+    const feats = prediction.isochrones.features;
+    const maxH = Math.max(...feats.map(f=>f.properties.hours));
+    setSource("iso", prediction.isochrones, [
+      { id:"iso-fill", type:"fill", source:"iso", paint:{
+          "fill-color":["interpolate",["linear"],["get","hours"],1,"#ffd08a",3,"#f08a3c",6,"#c0261a"],
+          "fill-opacity":0.30 } },
+      { id:"iso-line", type:"line", source:"iso", paint:{ "line-color":"#c0261a","line-width":1,"line-opacity":0.6 } },
+    ]);
+    // Keep fire dots above the fill.
+    if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
+    ["iso-fill","iso-line"].forEach(id=> map.setLayoutProperty(id,"visibility","visible"));
+    const p = prediction.parameters;
+    document.getElementById("fcInfo").textContent =
+      `engine: ${prediction.engine} · ignition: ${p.ignition} · fuel ${p.fuel_model} · ` +
+      `wind ${Math.round(p.wind_speed_kmh)}→${Math.round(p.wind_end_speed_kmh)} km/h`;
+    const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
+    applyHour(maxH);
+    document.getElementById("fc").style.display = "block";
+    document.getElementById("predictBtn").style.display = "none";
+    document.getElementById("legend").classList.add("show");
+  } catch(e){ toast("Forecast failed: "+e.message); btn.disabled=false; btn.textContent="Forecast spread →"; }
+}
+function applyHour(h){
+  document.getElementById("hourLabel").textContent = "+"+h+"h";
+  const f = ["<=", ["get","hours"], h + 0.001];
+  if(map.getLayer("iso-fill")) map.setFilter("iso-fill", f);
+  if(map.getLayer("iso-line")) map.setFilter("iso-line", f);
+}
+
+document.getElementById("predictBtn").onclick = runForecast;
+document.getElementById("hour").oninput = (e)=> applyHour(Number(e.target.value));
+document.getElementById("addr").addEventListener("keydown", e=>{ if(e.key==="Enter") search(); });
+
+// Tap a fire dot
+map.on("load", ()=>{ toast("Search an address to see fires near you.", 3500); });
+map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
+  const f = fires.find(x=>String(x.id)===String(id)); if(f) openSheet(f); });
+map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");
+map.on("mouseleave","fires-dot",()=> map.getCanvas().style.cursor="");
+
+// Geolocation (note: iOS Safari blocks this over plain http on a LAN IP —
+// use the address box there; it works on localhost / https).
+document.getElementById("locate").onclick = ()=>{
+  if(!navigator.geolocation){ toast("Geolocation unavailable — type an address."); return; }
+  toast("Getting your location…", 0);
+  navigator.geolocation.getCurrentPosition(
+    p=>{ map.flyTo({center:[p.coords.longitude,p.coords.latitude],zoom:9});
+         loadFires(p.coords.latitude, p.coords.longitude); },
+    ()=> toast("Location blocked (needs https on a phone) — type an address instead."),
+    { enableHighAccuracy:false, timeout:12000 }
+  );
+};
+</script>
+</body>
+</html>

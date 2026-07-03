@@ -9,11 +9,16 @@ Run locally:
 
 Interactive docs at http://localhost:8000/docs
 """
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from .config import get_settings
 from .routers import fires, geocode, predict, weather
+
+WEB_DIR = Path(__file__).parent / "web"
 
 settings = get_settings()
 
@@ -35,6 +40,12 @@ app.include_router(geocode.router)
 app.include_router(fires.router)
 app.include_router(weather.router)
 app.include_router(predict.router)
+
+
+@app.get("/", include_in_schema=False)
+async def web_map():
+    """Serve the single-page web map (works in any browser, incl. iPhone Safari)."""
+    return FileResponse(WEB_DIR / "index.html")
 
 
 @app.get("/health", tags=["meta"])
