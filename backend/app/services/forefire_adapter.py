@@ -23,6 +23,7 @@ from typing import Any
 
 from ..config import get_settings
 from ..schemas import PredictRequest, PredictResponse
+from . import fires as fires_svc
 from . import fuel as fuel_svc
 from . import spread_model
 from . import terrain as terrain_svc
@@ -110,11 +111,33 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
         else:
             notes.append(f"Estimated local slope: {slope:.0f}%.")
 
+    # Ignition: start from the real mapped fire footprint when one exists, so a
+    # large fire's forecast grows from its actual perimeter rather than a point.
+    origin_lat, origin_lon = req.lat, req.lon
+    initial_front = None
+    ignition = "point"
+    if req.ignite_from_perimeter:
+        try:
+            geom = await fires_svc.nearest_perimeter_geometry(req.lat, req.lon, radius_km=8.0)
+            parsed = spread_model.perimeter_to_front(geom) if geom else None
+            if parsed:
+                origin_lat, origin_lon, initial_front = parsed
+                ignition = "perimeter"
+                notes.append("Ignited from mapped NIFC perimeter (fire's current footprint).")
+            else:
+                notes.append("No usable perimeter nearby; ignited from the point.")
+        except Exception as exc:
+            notes.append(f"Perimeter lookup failed ({exc}); ignited from the point.")
+
     return {
         "wind_series": wind_series,
         "wind_source": wind_source,
         "fuel": fuel_params,
         "slope_percent": float(slope),
+        "origin_lat": origin_lat,
+        "origin_lon": origin_lon,
+        "initial_front": initial_front,
+        "ignition": ignition,
         "notes": notes,
     }
 
@@ -157,17 +180,18 @@ async def predict(req: PredictRequest) -> PredictResponse:
             notes.append(f"ForeFire unavailable, used built-in model. ({exc})")
 
     fc = spread_model.simulate_timevarying(
-        lat=req.lat,
-        lon=req.lon,
+        lat=inputs["origin_lat"],
+        lon=inputs["origin_lon"],
         wind_series=inputs["wind_series"],
         ros_ref=inputs["fuel"]["ros_ref"],
         wind_factor=inputs["fuel"]["wind_factor"],
         slope_percent=inputs["slope_percent"],
         step_minutes=req.step_minutes,
+        initial_front=inputs["initial_front"],
     )
     notes.append(
         f"Built-in time-varying elliptical model ({fc['properties']['steps']} steps, "
-        f"wind: {inputs['wind_source']})."
+        f"ignition: {inputs['ignition']}, wind: {inputs['wind_source']})."
     )
     return PredictResponse(
         engine="builtin",
@@ -183,6 +207,7 @@ def _params(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]:
     end_speed, end_dir = series[-1]
     return {
         "origin": {"lat": req.lat, "lon": req.lon},
+        "ignition": inputs["ignition"],
         "duration_hours": req.duration_hours,
         "step_minutes": req.step_minutes,
         "wind_source": inputs["wind_source"],

@@ -27,7 +27,12 @@ References:
 import math
 from typing import Any, Optional
 
-from .geo import bearing_to_math_radians, local_meters_to_lonlat, wind_from_to_toward_bearing
+from .geo import (
+    bearing_to_math_radians,
+    local_meters_to_lonlat,
+    lonlat_to_local_meters,
+    wind_from_to_toward_bearing,
+)
 
 # Wind speed (km/h) the fuel table's ros_ref is calibrated to.
 REF_WIND_KMH = 20.0
@@ -185,6 +190,78 @@ def _seed_front(n: int, radius_m: float) -> list[tuple[float, float]]:
     ]
 
 
+def _ring_area(ring: list[list[float]]) -> float:
+    """Absolute shoelace area of a lon/lat ring (in deg^2 — only for comparison)."""
+    area = 0.0
+    for i in range(len(ring) - 1):
+        x1, y1 = ring[i]
+        x2, y2 = ring[i + 1]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def _largest_ring(geometry: dict) -> Optional[list[list[float]]]:
+    """Extract the largest exterior ring (list of [lon,lat]) from a GeoJSON
+    Polygon or MultiPolygon geometry, chosen by area."""
+    gtype = (geometry or {}).get("type")
+    coords = (geometry or {}).get("coordinates")
+    if not coords:
+        return None
+    if gtype == "Polygon":
+        return coords[0]
+    if gtype == "MultiPolygon":
+        rings = [poly[0] for poly in coords if poly]
+        return max(rings, key=_ring_area) if rings else None
+    return None
+
+
+def perimeter_to_front(geometry: dict, n_points: int = FRONT_POINTS):
+    """
+    Turn a GeoJSON fire perimeter into an initial front for propagation.
+
+    Returns (origin_lat, origin_lon, front_pts_meters) where the origin is the
+    perimeter centroid and the front is a star-shaped resampling to n_points
+    equally-spaced angles about that centroid. Star resampling both normalizes
+    vertex count and keeps the front compatible with the centroid-normal
+    propagator. Returns None if the geometry can't be used.
+    """
+    ring = _largest_ring(geometry)
+    if not ring or len(ring) < 3:
+        return None
+
+    # Drop the closing duplicate vertex so it doesn't skew the centroid.
+    verts = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+    if len(verts) < 3:
+        return None
+
+    origin_lon = sum(p[0] for p in verts) / len(verts)
+    origin_lat = sum(p[1] for p in verts) / len(verts)
+
+    # Vertices as (angle from centroid, radius in meters).
+    polar: list[tuple[float, float]] = []
+    for lon, lat in verts:
+        dx, dy = lonlat_to_local_meters(origin_lat, origin_lon, lon, lat)
+        r = math.hypot(dx, dy)
+        if r <= 0:
+            continue
+        polar.append((math.atan2(dy, dx) % (2 * math.pi), r))
+    if len(polar) < 3:
+        return None
+    polar.sort()
+
+    # Resample: for each target angle take the radius of the nearest source
+    # vertex by angle (robust for irregular, roughly star-shaped perimeters).
+    angles = [a for a, _ in polar]
+    radii = [r for _, r in polar]
+    front: list[tuple[float, float]] = []
+    for k in range(n_points):
+        target = 2 * math.pi * k / n_points
+        j = min(range(len(angles)), key=lambda i: abs(((angles[i] - target + math.pi) % (2 * math.pi)) - math.pi))
+        r = radii[j]
+        front.append((r * math.cos(target), r * math.sin(target)))
+    return origin_lat, origin_lon, front
+
+
 def _centroid(pts: list[tuple[float, float]]) -> tuple[float, float]:
     n = len(pts)
     return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
@@ -209,6 +286,7 @@ def simulate_timevarying(
     wind_factor: float,
     slope_percent: float,
     step_minutes: int,
+    initial_front: Optional[list[tuple[float, float]]] = None,
 ) -> dict[str, Any]:
     """
     Grow the fire step by step under a per-step wind series.
@@ -216,10 +294,14 @@ def simulate_timevarying(
     wind_series: one (wind_speed_kmh, wind_direction_deg_FROM) per step. Its
     length sets how many isochrones are produced.
 
+    initial_front: optional starting perimeter as (east,north) meters relative to
+    (lat,lon) — e.g. a real NIFC fire footprint from `perimeter_to_front`. When
+    omitted, the fire starts from a small seed circle (point ignition).
+
     Returns the same GeoJSON FeatureCollection shape as `simulate` (one nested
     polygon per step) so the mobile app renders both engines identically.
     """
-    front = _seed_front(FRONT_POINTS, SEED_RADIUS_M)
+    front = list(initial_front) if initial_front else _seed_front(FRONT_POINTS, SEED_RADIUS_M)
     features: list[dict[str, Any]] = []
     minutes = 0
 
@@ -267,5 +349,9 @@ def simulate_timevarying(
     return {
         "type": "FeatureCollection",
         "features": features,
-        "properties": {"model": "huygens-elliptical-timevarying", "steps": len(features)},
+        "properties": {
+            "model": "huygens-elliptical-timevarying",
+            "steps": len(features),
+            "seeded_from_perimeter": initial_front is not None,
+        },
     }

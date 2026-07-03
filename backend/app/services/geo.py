@@ -33,6 +33,16 @@ def local_meters_to_lonlat(origin_lat: float, origin_lon: float, dx_m: float, dy
     return origin_lon + dlon, origin_lat + dlat
 
 
+def lonlat_to_local_meters(origin_lat: float, origin_lon: float, lon: float, lat: float):
+    """
+    Inverse of local_meters_to_lonlat: express a lon/lat as an east/north offset
+    in meters from an origin, using the same equirectangular approximation.
+    """
+    dy_m = math.radians(lat - origin_lat) * EARTH_RADIUS_M
+    dx_m = math.radians(lon - origin_lon) * EARTH_RADIUS_M * math.cos(math.radians(origin_lat))
+    return dx_m, dy_m
+
+
 def bearing_to_math_radians(bearing_deg: float) -> float:
     """
     Convert a compass bearing (0=N, 90=E, clockwise) to standard math radians

@@ -106,6 +106,61 @@ def test_timevarying_windshift_bends_fire_south():
     assert south_shift < south_steady - 0.005                 # clearly bent south
 
 
+def _square_polygon(clat, clon, half_deg):
+    ring = [
+        [clon - half_deg, clat - half_deg],
+        [clon + half_deg, clat - half_deg],
+        [clon + half_deg, clat + half_deg],
+        [clon - half_deg, clat + half_deg],
+        [clon - half_deg, clat - half_deg],
+    ]
+    return {"type": "Polygon", "coordinates": [ring]}
+
+
+def test_perimeter_to_front_centroid_and_count():
+    geom = _square_polygon(34.0, -118.0, 0.02)
+    parsed = sm.perimeter_to_front(geom, n_points=120)
+    assert parsed is not None
+    olat, olon, front = parsed
+    assert abs(olat - 34.0) < 1e-6 and abs(olon - (-118.0)) < 1e-6
+    assert len(front) == 120
+    # Star radius should be on the order of the square's ~2 km half-size.
+    radii = [math.hypot(x, y) for x, y in front]
+    assert 1500 < max(radii) < 3500
+
+
+def test_perimeter_multipolygon_picks_largest():
+    small = _square_polygon(34.0, -118.0, 0.005)["coordinates"]
+    big = _square_polygon(34.0, -118.0, 0.03)["coordinates"]
+    geom = {"type": "MultiPolygon", "coordinates": [small, big]}
+    parsed = sm.perimeter_to_front(geom, n_points=60)
+    assert parsed is not None
+    _, _, front = parsed
+    assert max(math.hypot(x, y) for x, y in front) > 2500  # chose the big one
+
+
+def test_perimeter_seeded_starts_large_and_grows():
+    geom = _square_polygon(34.0, -118.0, 0.02)
+    _, _, front0 = sm.perimeter_to_front(geom, n_points=FRONT if (FRONT := sm.FRONT_POINTS) else 180)
+    series = [(20.0, 270.0)] * 4
+    peri = sm.simulate_timevarying(
+        lat=34.0, lon=-118.0, wind_series=series, ros_ref=9.0, wind_factor=1.1,
+        slope_percent=0, step_minutes=60, initial_front=front0,
+    )
+    pt = sm.simulate_timevarying(
+        lat=34.0, lon=-118.0, wind_series=series, ros_ref=9.0, wind_factor=1.1,
+        slope_percent=0, step_minutes=60, initial_front=None,
+    )
+    peri_areas = [f["properties"]["area_km2"] for f in peri["features"]]
+    assert peri_areas == sorted(peri_areas)                      # grows
+    assert peri["properties"]["seeded_from_perimeter"] is True
+    assert pt["properties"]["seeded_from_perimeter"] is False
+    # Starting from a real footprint yields a larger burned area than a point.
+    assert peri_areas[-1] > pt["features"][-1]["properties"]["area_km2"]
+    # And the first isochrone already covers roughly the footprint (~ (2*2.2km)^2).
+    assert peri_areas[0] > 5.0
+
+
 def test_timevarying_calm_is_roughly_round():
     series = [(0.0, 270.0)] * 3
     fc = sm.simulate_timevarying(

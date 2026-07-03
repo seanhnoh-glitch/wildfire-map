@@ -119,6 +119,14 @@ as the wind shifts**, the same Huygens-wavelet approach FARSITE uses
 `wind_direction_deg` to hold wind constant instead, or set
 `use_forecast_wind=false`.
 
+**Ignition from the real footprint.** When a mapped NIFC perimeter exists near the
+requested point (`ignite_from_perimeter`, default on), the forecast starts from
+that polygon — resampled to a star-shaped front about its centroid
+(`perimeter_to_front`) — instead of a seed circle. So a large fire's forecast
+grows outward from its *actual current footprint*. With no perimeter available it
+falls back to point ignition. The response's `parameters.ignition` reports which
+was used.
+
 **References:** Rothermel (1972); Anderson (1983); Alexander (1985);
 Scott & Burgan (2005). This is a research/education tool — **not** operational
 fire-behavior guidance.
