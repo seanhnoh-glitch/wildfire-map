@@ -63,3 +63,55 @@ def test_haversine_known_distance():
     # ~roughly one degree of latitude is ~111 km
     d = haversine_km(34.0, -118.0, 35.0, -118.0)
     assert 110 < d < 112
+
+
+# --- Time-varying (Huygens) propagation --------------------------------------
+
+def _tip(feature, axis="lon"):
+    ring = feature["geometry"]["coordinates"][0]
+    i = 0 if axis == "lon" else 1
+    return max(c[i] for c in ring), min(c[i] for c in ring)
+
+
+def test_timevarying_constant_wind_nested_and_downwind():
+    # Constant wind from the west for 6 h -> fire grows eastward, nested.
+    series = [(25.0, 270.0)] * 6
+    fc = sm.simulate_timevarying(
+        lat=34.05, lon=-118.24, wind_series=series,
+        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
+    )
+    feats = fc["features"]
+    assert len(feats) == 6
+    areas = [f["properties"]["area_km2"] for f in feats]
+    assert areas == sorted(areas) and areas[0] > 0            # monotonic growth
+    east_tip, _ = _tip(feats[-1])
+    assert east_tip > -118.24                                 # pushed east
+
+
+def test_timevarying_windshift_bends_fire_south():
+    # 3 h wind from the west (pushes east), then 3 h from the north (pushes south).
+    shifting = [(25.0, 270.0)] * 3 + [(25.0, 0.0)] * 3
+    steady = [(25.0, 270.0)] * 6
+    fc_shift = sm.simulate_timevarying(
+        lat=34.05, lon=-118.24, wind_series=shifting,
+        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
+    )
+    fc_steady = sm.simulate_timevarying(
+        lat=34.05, lon=-118.24, wind_series=steady,
+        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
+    )
+    # After the shift, the front must reach farther SOUTH than the steady-wind run.
+    _, south_shift = _tip(fc_shift["features"][-1], axis="lat")
+    _, south_steady = _tip(fc_steady["features"][-1], axis="lat")
+    assert south_shift < south_steady - 0.005                 # clearly bent south
+
+
+def test_timevarying_calm_is_roughly_round():
+    series = [(0.0, 270.0)] * 3
+    fc = sm.simulate_timevarying(
+        lat=40.0, lon=-120.0, wind_series=series,
+        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
+    )
+    east, west = _tip(fc["features"][-1])
+    # near-symmetric about the origin longitude when there's no wind
+    assert abs((east + 120.0) + (west + 120.0)) < 0.01

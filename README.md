@@ -25,8 +25,8 @@ predicted to spread** over the next hours — driven by live wind, fuel, and ter
 | Fuel model at a point (LANDFIRE) + Scott & Burgan params | ✅ live |
 | Slope estimate (Open-Meteo elevation) | ✅ live |
 | Spread forecast → GeoJSON isochrones (built-in model) | ✅ live |
+| **HRRR-backed hourly forecast wind → time-evolving spread (fire bends as wind shifts)** | ✅ live |
 | ForeFire engine | 🔌 adapter wired, NetCDF builder pending — see `docs/FOREFIRE_SETUP.md` |
-| HRRR forecast wind (time-evolving spread) | ⏳ documented, not yet wired |
 
 Full source list: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**.
 
@@ -100,7 +100,8 @@ ForeFire wiring guide.
 
 ## Roadmap
 
-1. Time-evolving forecast using HRRR wind fields.
-2. ForeFire NetCDF landscape builder (LANDFIRE + 3DEP clips) — `docs/FOREFIRE_SETUP.md`.
-3. Ignite from mapped perimeters instead of a single point.
-4. Push notifications when a new fire appears inside a saved radius.
+1. ✅ ~~Time-evolving forecast using HRRR wind~~ — done (`simulate_timevarying` + `forecast_hourly`).
+2. Raw NOMADS HRRR GRIB grids for a *spatial* wind field (not one point).
+3. ForeFire NetCDF landscape builder (LANDFIRE + 3DEP clips) — `docs/FOREFIRE_SETUP.md`.
+4. Ignite from mapped perimeters instead of a single point.
+5. Push notifications when a new fire appears inside a saved radius.

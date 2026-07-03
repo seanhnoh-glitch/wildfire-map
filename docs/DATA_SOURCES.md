@@ -46,9 +46,10 @@ Legend: 🔑 needs a (free) key · 🆓 no key · ⏳ wired but not yet fully im
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **NWS api.weather.gov** 🆓 | Official US current conditions: wind speed/direction/gust, temp, RH. | none | `services/weather.py` (primary) |
-| **Open-Meteo Forecast** 🆓 | Global current + forecast wind/temp/RH. Fallback when NWS gridpoint lookup fails. | none | `services/weather.py` (fallback) |
-| **NOAA HRRR** ⏳ | 3 km hourly wind *forecast* grids — the key to a truly predictive, time-evolving forecast (feed future wind into ForeFire). | none | (future: forecast-driven spread) |
+| **NWS api.weather.gov** 🆓 | Official US current conditions: wind speed/direction/gust, temp, RH. | none | `services/weather.py` (`current`, primary) |
+| **Open-Meteo Forecast** 🆓 | Global current + **hourly forecast** wind/temp/RH. `current` fallback AND the source of hourly forecast wind. | none | `services/weather.py` (`current` fallback, `forecast_hourly`) |
+| **NOAA HRRR (via Open-Meteo)** ✅ | 3 km hourly wind *forecast* — the time-evolving driver. Open-Meteo's `best_match` uses HRRR for short-range US, so `forecast_hourly` is HRRR-quality without GRIB parsing. Pin explicitly with `models=ncep_hrrr_conus`. | none | `services/weather.py` (`forecast_hourly`) → time-varying spread |
+| **NOAA HRRR raw grids (NOMADS)** ⏳ | Direct GRIB2 HRRR for higher *spatial* resolution (a wind field, not one point). Needs cfgrib/Herbie. | none | (future: spatial wind field) |
 | **Synoptic / MesoWest (RAWS)** ⏳ | Real-time observed wind from ground stations near the fire. | free tier key | (future: nearest-station wind) |
 
 - NWS: https://www.weather.gov/documentation/services-web-api · Open-Meteo: https://open-meteo.com/
@@ -107,6 +108,16 @@ The fallback/baseline engine (`services/spread_model.py`) is a documented
   bounded to [1, 8].
 - Each forecast step is one nested ellipse, exported as a GeoJSON polygon tagged
   with elapsed hours, head distance, and burned area.
+
+**Time-varying forecast (`simulate_timevarying`).** The default `/predict` path
+does *not* assume one fixed wind. It grows the perimeter incrementally: at each
+hourly step, every point on the front advances outward by that hour's local
+spread rate (elliptical polar form — fastest downwind, slowest backing). Feeding
+the **HRRR-backed hourly wind series** into this makes the fire genuinely **bend
+as the wind shifts**, the same Huygens-wavelet approach FARSITE uses
+(Anderson 1983; Richards 1990). Supply an explicit `wind_speed_kmh` /
+`wind_direction_deg` to hold wind constant instead, or set
+`use_forecast_wind=false`.
 
 **References:** Rothermel (1972); Anderson (1983); Alexander (1985);
 Scott & Burgan (2005). This is a research/education tool — **not** operational

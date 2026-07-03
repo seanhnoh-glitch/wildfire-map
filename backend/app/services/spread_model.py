@@ -158,3 +158,114 @@ def simulate(
             "wind_toward_bearing_deg": round(toward, 1),
         },
     }
+
+
+# --- Time-varying propagation (Huygens elliptical-wavelet approximation) ------
+#
+# The closed-form `simulate` above assumes ONE constant wind. To make a genuinely
+# time-evolving forecast that bends as the hourly wind shifts, we instead grow the
+# fire perimeter incrementally: at each step every point on the front advances
+# outward by that hour's local spread rate. The rate follows the elliptical polar
+# form (fastest downwind, slowest backing), which is the basis of Huygens-wavelet
+# fire growth (Anderson 1983; Richards 1990) used by simulators like FARSITE.
+#
+# Simplification: the outward direction at each vertex is taken from the fire's
+# centroid (stable and self-intersection-resistant for the convex-ish fronts a
+# short forecast produces), rather than the exact local front normal. Good for a
+# research prototype; not operational guidance.
+
+FRONT_POINTS = 180
+SEED_RADIUS_M = 30.0
+
+
+def _seed_front(n: int, radius_m: float) -> list[tuple[float, float]]:
+    return [
+        (radius_m * math.cos(2 * math.pi * k / n), radius_m * math.sin(2 * math.pi * k / n))
+        for k in range(n)
+    ]
+
+
+def _centroid(pts: list[tuple[float, float]]) -> tuple[float, float]:
+    n = len(pts)
+    return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
+
+
+def _polygon_area_m2(pts: list[tuple[float, float]]) -> float:
+    """Shoelace area of a ring given in meters."""
+    area = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def simulate_timevarying(
+    lat: float,
+    lon: float,
+    wind_series: list[tuple[float, float]],
+    ros_ref: float,
+    wind_factor: float,
+    slope_percent: float,
+    step_minutes: int,
+) -> dict[str, Any]:
+    """
+    Grow the fire step by step under a per-step wind series.
+
+    wind_series: one (wind_speed_kmh, wind_direction_deg_FROM) per step. Its
+    length sets how many isochrones are produced.
+
+    Returns the same GeoJSON FeatureCollection shape as `simulate` (one nested
+    polygon per step) so the mobile app renders both engines identically.
+    """
+    front = _seed_front(FRONT_POINTS, SEED_RADIUS_M)
+    features: list[dict[str, Any]] = []
+    minutes = 0
+
+    for step_idx, (speed, dir_from) in enumerate(wind_series, start=1):
+        minutes += step_minutes
+        toward = wind_from_to_toward_bearing(dir_from)
+        toward_rad = bearing_to_math_radians(toward)
+        wx, wy = math.cos(toward_rad), math.sin(toward_rad)  # unit wind-toward (east, north)
+
+        lb = length_to_breadth(speed)
+        e = math.sqrt(max(0.0, 1.0 - 1.0 / (lb * lb)))
+        head_rate = head_ros_m_per_min(ros_ref, wind_factor, speed, slope_percent)  # m/min
+
+        cx, cy = _centroid(front)
+        new_front: list[tuple[float, float]] = []
+        for px, py in front:
+            nx, ny = px - cx, py - cy
+            norm = math.hypot(nx, ny) or 1.0
+            nx, ny = nx / norm, ny / norm  # outward direction from centroid
+            cos_phi = nx * wx + ny * wy    # alignment with wind-toward
+            # Elliptical polar rate: head_rate downwind, (1-e)/(1+e)*head backing.
+            rate = head_rate * (1.0 - e) / (1.0 - e * cos_phi)
+            disp = rate * step_minutes     # meters advanced this step
+            new_front.append((px + nx * disp, py + ny * disp))
+        front = new_front
+
+        # Head distance = farthest projection of the front onto the wind-toward axis.
+        head_m = max(px * wx + py * wy for px, py in front)
+        ring = [list(local_meters_to_lonlat(lat, lon, px, py)) for px, py in front]
+        ring.append(ring[0])  # close
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "properties": {
+                "step": step_idx,
+                "minutes": minutes,
+                "hours": round(minutes / 60.0, 2),
+                "head_distance_km": round(head_m / 1000.0, 3),
+                "area_km2": round(_polygon_area_m2(front) / 1_000_000.0, 3),
+                "wind_speed_kmh": round(speed, 1),
+                "wind_from_deg": round(dir_from, 1),
+            },
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "properties": {"model": "huygens-elliptical-timevarying", "steps": len(features)},
+    }

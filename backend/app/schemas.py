@@ -67,8 +67,12 @@ class PredictRequest(BaseModel):
     duration_hours: float = Field(default=6.0, ge=0.5, le=48.0)
     step_minutes: int = Field(default=60, ge=15, le=360)
     # Optional overrides; if omitted the service fetches live weather at the point.
+    # When set, wind is held CONSTANT at these values for the whole forecast.
     wind_speed_kmh: Optional[float] = None
     wind_direction_deg: Optional[float] = None
+    # Use hourly HRRR-backed forecast wind so the fire bends as the wind shifts.
+    # Ignored if an explicit wind override above is supplied.
+    use_forecast_wind: bool = True
     # Optional fuel/terrain hints; if omitted the service uses live/default layers.
     fuel_model: Optional[str] = Field(default=None, description="Scott & Burgan code, e.g. 'GR2', 'TU5'")
     slope_percent: Optional[float] = None

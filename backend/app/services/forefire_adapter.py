@@ -43,19 +43,58 @@ def _forefire_available() -> bool:
     return bool(settings.forefire_binary)
 
 
+def _steps(req: PredictRequest) -> int:
+    return max(1, int(round(req.duration_hours * 60 / req.step_minutes)))
+
+
+async def _build_wind_series(req: PredictRequest, notes: list[str]) -> tuple[list[tuple[float, float]], str]:
+    """
+    Produce one (speed_kmh, dir_from_deg) per forecast step.
+
+      - explicit override  -> constant wind, repeated for every step
+      - use_forecast_wind  -> HRRR-backed hourly forecast, sampled per step
+      - otherwise / on error -> constant current wind
+
+    Returns (series, wind_source_label).
+    """
+    n = _steps(req)
+
+    if req.wind_speed_kmh is not None and req.wind_direction_deg is not None:
+        notes.append(
+            f"Wind held constant at {req.wind_speed_kmh:.0f} km/h @ {req.wind_direction_deg:.0f}deg (override)."
+        )
+        return [(req.wind_speed_kmh, req.wind_direction_deg)] * n, "override (constant)"
+
+    if req.use_forecast_wind:
+        try:
+            hourly = await weather_svc.forecast_hourly(req.lat, req.lon, int(req.duration_hours) + 1)
+            series: list[tuple[float, float]] = []
+            for k in range(n):
+                # Map step k (ending at minute (k+1)*step) to the hour it falls in.
+                hour_idx = min(len(hourly) - 1, int((k * req.step_minutes) // 60))
+                h = hourly[hour_idx]
+                series.append((float(h["wind_speed_kmh"]), float(h["wind_direction_deg"])))
+            first, last = series[0], series[-1]
+            notes.append(
+                f"HRRR-backed forecast wind: start {first[0]:.0f} km/h @ {first[1]:.0f}deg -> "
+                f"end {last[0]:.0f} km/h @ {last[1]:.0f}deg."
+            )
+            return series, "Open-Meteo hourly (HRRR-backed)"
+        except Exception as exc:
+            notes.append(f"Forecast wind unavailable ({exc}); using constant current wind.")
+
+    wx = await weather_svc.current(req.lat, req.lon)
+    speed = wx.wind_speed_kmh if wx.wind_speed_kmh is not None else 15.0
+    direction = wx.wind_direction_deg if wx.wind_direction_deg is not None else 270.0
+    notes.append(f"Current wind from {wx.source}: {speed:.0f} km/h @ {direction:.0f}deg (held constant).")
+    return [(speed, direction)] * n, wx.source
+
+
 async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
-    """Resolve wind, fuel, and slope, using overrides when provided."""
+    """Resolve the wind series, fuel, and slope, using overrides when provided."""
     notes: list[str] = []
 
-    wind_speed = req.wind_speed_kmh
-    wind_dir = req.wind_direction_deg
-    if wind_speed is None or wind_dir is None:
-        wx = await weather_svc.current(req.lat, req.lon)
-        if wind_speed is None:
-            wind_speed = wx.wind_speed_kmh if wx.wind_speed_kmh is not None else 15.0
-        if wind_dir is None:
-            wind_dir = wx.wind_direction_deg if wx.wind_direction_deg is not None else 270.0
-        notes.append(f"Wind from {wx.source}: {wind_speed:.0f} km/h @ {wind_dir:.0f}deg (from).")
+    wind_series, wind_source = await _build_wind_series(req, notes)
 
     fuel_code = req.fuel_model or await fuel_svc.fuel_at(req.lat, req.lon)
     fuel_params = fuel_svc.get_params(fuel_code)
@@ -72,8 +111,8 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
             notes.append(f"Estimated local slope: {slope:.0f}%.")
 
     return {
-        "wind_speed_kmh": float(wind_speed),
-        "wind_direction_deg": float(wind_dir),
+        "wind_series": wind_series,
+        "wind_source": wind_source,
         "fuel": fuel_params,
         "slope_percent": float(slope),
         "notes": notes,
@@ -117,22 +156,18 @@ async def predict(req: PredictRequest) -> PredictResponse:
                 raise
             notes.append(f"ForeFire unavailable, used built-in model. ({exc})")
 
-    fc = spread_model.simulate(
+    fc = spread_model.simulate_timevarying(
         lat=req.lat,
         lon=req.lon,
-        duration_hours=req.duration_hours,
-        step_minutes=req.step_minutes,
-        wind_speed_kmh=inputs["wind_speed_kmh"],
-        wind_direction_deg=inputs["wind_direction_deg"],
+        wind_series=inputs["wind_series"],
         ros_ref=inputs["fuel"]["ros_ref"],
         wind_factor=inputs["fuel"]["wind_factor"],
         slope_percent=inputs["slope_percent"],
+        step_minutes=req.step_minutes,
     )
-    # Surface the model-derived quantities in the notes for transparency.
-    p = fc.get("properties", {})
     notes.append(
-        f"Built-in elliptical model: head ROS {p.get('head_ros_m_per_min')} m/min, "
-        f"L:B {p.get('length_to_breadth')}."
+        f"Built-in time-varying elliptical model ({fc['properties']['steps']} steps, "
+        f"wind: {inputs['wind_source']})."
     )
     return PredictResponse(
         engine="builtin",
@@ -143,12 +178,18 @@ async def predict(req: PredictRequest) -> PredictResponse:
 
 
 def _params(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]:
+    series = inputs["wind_series"]
+    start_speed, start_dir = series[0]
+    end_speed, end_dir = series[-1]
     return {
         "origin": {"lat": req.lat, "lon": req.lon},
         "duration_hours": req.duration_hours,
         "step_minutes": req.step_minutes,
-        "wind_speed_kmh": round(inputs["wind_speed_kmh"], 1),
-        "wind_direction_deg": round(inputs["wind_direction_deg"], 1),
+        "wind_source": inputs["wind_source"],
+        "wind_speed_kmh": round(start_speed, 1),          # start value (map label)
+        "wind_direction_deg": round(start_dir, 1),
+        "wind_end_speed_kmh": round(end_speed, 1),
+        "wind_end_direction_deg": round(end_dir, 1),
         "fuel_model": inputs["fuel"]["code"],
         "fuel_name": inputs["fuel"]["name"],
         "slope_percent": inputs["slope_percent"],
