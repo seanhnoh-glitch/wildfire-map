@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Wildfire Map",
+    "slug": "wildfire-map",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.wildfiremap",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Used to show wildfires near your current location."
+      }
+    },
+    "android": {
+      "package": "com.example.wildfiremap",
+      "permissions": ["ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"]
+    },
+    "plugins": [
+      "expo-dev-client",
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-location",
+        { "locationWhenInUsePermission": "Used to show wildfires near your current location." }
+      ]
+    ]
+  }
+}

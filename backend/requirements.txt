@@ -1,0 +1,18 @@
+# --- Wildfire Map backend dependencies ---
+# Core web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.4
+pydantic-settings==2.3.4
+
+# Async HTTP client for upstream data APIs (FIRMS, NWS, Open-Meteo, ArcGIS, Census)
+httpx==0.27.0
+
+# Geospatial helpers for the spread model + isochrone geometry
+shapely==2.0.4
+pyproj==3.6.1
+numpy==1.26.4
+
+# Optional: only needed if you wire the real ForeFire engine (see docs/FOREFIRE_SETUP.md).
+# pyforefire is installed from the ForeFire source build, not PyPI, so it is
+# intentionally NOT listed here. The prediction service degrades gracefully without it.

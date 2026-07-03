@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Node / Expo
+node_modules/
+.expo/
+dist/
+web-build/
+*.log
+npm-debug.*
+yarn-error.*
+
+# Native build output
+android/
+ios/
+!mobile/app.json
+
+# Data caches (LANDFIRE/DEM clips, NetCDF landscapes)
+data/
+*.nc
+*.tif
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
