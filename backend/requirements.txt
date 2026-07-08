@@ -8,10 +8,15 @@ pydantic-settings==2.3.4
 # Async HTTP client for upstream data APIs (FIRMS, NWS, Open-Meteo, ArcGIS, Census)
 httpx==0.27.0
 
-# Geospatial: shapely powers the robust anisotropic spread growth (required).
-# Unpinned lower bound so prebuilt wheels resolve on newer Python (e.g. 3.13).
+# Geospatial: shapely handles perimeter geometry (ignition footprint, centroids,
+# simplification) and the fuel-grid handling. Unpinned lower bound so prebuilt
+# wheels resolve on newer Python (e.g. 3.13).
 shapely>=2.0
 
-# Optional: only needed if you wire the real ForeFire engine (see docs/FOREFIRE_SETUP.md).
-# pyforefire is installed from the ForeFire source build, not PyPI, so it is
-# intentionally NOT listed here. The prediction service degrades gracefully without it.
+# numpy builds the fuel/wind/elevation arrays passed to pyforefire.
+numpy>=1.24
+
+# ForeFire is the prediction engine. pyforefire is NOT on PyPI — it is compiled
+# from the ForeFire C++ source (with netCDF4) in the Docker image; see
+# backend/Dockerfile and docs/FOREFIRE_SETUP.md. Without it, /predict returns 503
+# (there is no fallback engine), so run the backend via Docker for forecasts.

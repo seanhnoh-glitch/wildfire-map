@@ -1,5 +1,14 @@
 # Mobile app — bring-up guide (Windows / Android)
 
+> ⚠️ **Secondary / not actively maintained.** The **web map served at `/`** (open
+> `http://localhost:8000`) is the primary, maintained UI — it works in any phone
+> browser, no build required. This React Native app is from an earlier phase: it
+> still works against the API and gets all the backend modeling improvements
+> (water barriers, humidity-driven moisture, aspect, midflame wind), but it lacks
+> the web map's newer UI features (viewport hotspots, dots centered on perimeters,
+> the 24 h horizon and color styling) and forecasts default to 6 h. Use it only if
+> you specifically want a native app.
+
 Step-by-step to get the map running on an Android emulator or a physical phone.
 The app uses MapLibre native modules, so it **cannot run in Expo Go** — you build
 a small custom dev client with `expo prebuild` + `expo run:android`. That sounds

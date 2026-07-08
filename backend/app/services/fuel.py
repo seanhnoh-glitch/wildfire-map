@@ -1,104 +1,188 @@
 """
 Fuel data — the single most important input to any fire-spread model.
 
-Two responsibilities:
-  1. FUEL_MODELS: a lookup from Scott & Burgan (2005) 40-fuel-model codes to the
-     parameters the built-in spread model needs (a reference head rate-of-spread
-     and a wind-response exponent). These are approximate, literature-informed
-     values suitable for a research prototype, NOT operational fire behavior.
-  2. fuel_at(): query the live LANDFIRE fuel raster at a point. Best-effort; if
-     the service is unreachable it returns a sensible default so prediction still
-     runs. This is the seam where you plug in a full LANDFIRE clip for ForeFire.
+fuel_at() queries the live LANDFIRE FBFM40 raster at a point and returns the
+Scott & Burgan (2005) fuel-model code (e.g. "GR2"); get_params() attaches the
+model's descriptive name. ForeFire keys its simulation off the code (it looks the
+fuel's physical parameters up in its own STDfarsiteFuelsTable), so that is all we
+need here. Both are best-effort: if LANDFIRE is unreachable or the pixel is
+non-burnable, fuel_at() returns None and get_params() falls back to GR2 so a
+forecast still runs.
 
-LANDFIRE FBFM40 ImageServer:
-  https://lfps.usgs.gov / https://landfire.gov  (public, no key)
+LANDFIRE FBFM40 ImageServer (LANDFIRE 2022 / LF2.3.0, CONUS):
+  https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2022/LF2022_FBFM40_CONUS/ImageServer
+  Public, no key. The `identify` op returns the raster pixel value — the integer
+  FBFM40 code (e.g. 102 = GR2) — which we map back to a Scott & Burgan code.
 """
+import json
 from typing import Optional
 
 import httpx
 
-# LANDFIRE 2022 Scott & Burgan 40 fire behavior fuel model image service (identify).
-LANDFIRE_FBFM40_IDENTIFY = (
-    "https://landfire.gov/arcgis/rest/services/Landfire/US_230/MapServer/identify"
-)
+from .fuel_table import BARRIER_FUEL_INDEX
 
-# Reference head rate of spread (meters/minute) under a nominal 20 km/h wind on
-# flat ground, plus a dimensionless wind-response factor. Grass spreads fast and
-# is very wind-driven; timber litter is slow. Non-burnable models spread at 0.
-# Values are ballpark, drawn from Scott & Burgan (2005) behavior classes.
-FUEL_MODELS: dict[str, dict] = {
-    # Non-burnable
-    "NB1": {"name": "Urban", "ros_ref": 0.0, "wind_factor": 0.0},
-    "NB8": {"name": "Open water", "ros_ref": 0.0, "wind_factor": 0.0},
-    "NB9": {"name": "Bare ground", "ros_ref": 0.0, "wind_factor": 0.0},
-    # Grass (GR) — fast, highly wind-driven
-    "GR1": {"name": "Short, sparse dry climate grass", "ros_ref": 4.0, "wind_factor": 1.0},
-    "GR2": {"name": "Low load dry climate grass", "ros_ref": 9.0, "wind_factor": 1.1},
-    "GR3": {"name": "Low load, very coarse grass", "ros_ref": 11.0, "wind_factor": 1.1},
-    "GR4": {"name": "Moderate load dry climate grass", "ros_ref": 15.0, "wind_factor": 1.2},
-    "GR5": {"name": "Low load humid climate grass", "ros_ref": 13.0, "wind_factor": 1.15},
-    # Grass-shrub (GS)
-    "GS1": {"name": "Low load dry climate grass-shrub", "ros_ref": 7.0, "wind_factor": 1.0},
-    "GS2": {"name": "Moderate load dry climate grass-shrub", "ros_ref": 10.0, "wind_factor": 1.05},
-    # Shrub (SH) — moderate, wind-driven
-    "SH1": {"name": "Low load dry climate shrub", "ros_ref": 4.0, "wind_factor": 0.9},
-    "SH2": {"name": "Moderate load dry climate shrub", "ros_ref": 6.0, "wind_factor": 0.95},
-    "SH5": {"name": "High load dry climate shrub", "ros_ref": 12.0, "wind_factor": 1.0},
-    "SH7": {"name": "Very high load dry climate shrub", "ros_ref": 14.0, "wind_factor": 1.0},
-    # Timber-understory (TU)
-    "TU1": {"name": "Low load dry timber-grass-shrub", "ros_ref": 3.0, "wind_factor": 0.7},
-    "TU5": {"name": "Very high load dry timber-shrub", "ros_ref": 5.0, "wind_factor": 0.7},
-    # Timber litter (TL) — slow, less wind-driven
-    "TL1": {"name": "Low load compact conifer litter", "ros_ref": 1.0, "wind_factor": 0.4},
-    "TL3": {"name": "Moderate load conifer litter", "ros_ref": 1.5, "wind_factor": 0.4},
-    "TL5": {"name": "High load conifer litter", "ros_ref": 2.0, "wind_factor": 0.45},
-    # Slash-blowdown (SB)
-    "SB1": {"name": "Low load activity fuel", "ros_ref": 3.0, "wind_factor": 0.6},
-    "SB3": {"name": "High load activity fuel", "ros_ref": 6.0, "wind_factor": 0.7},
-}
+# LANDFIRE 2022 Scott & Burgan 40 fire behavior fuel model image service.
+LANDFIRE_FBFM40_IMAGESERVER = (
+    "https://lfps.usgs.gov/arcgis/rest/services/"
+    "Landfire_LF2022/LF2022_FBFM40_CONUS/ImageServer"
+)
+LANDFIRE_FBFM40_IDENTIFY = LANDFIRE_FBFM40_IMAGESERVER + "/identify"
+LANDFIRE_FBFM40_GETSAMPLES = LANDFIRE_FBFM40_IMAGESERVER + "/getSamples"
+
+# Default fuel index for grid cells with no LANDFIRE sample (rare) — GR2 grass.
+_GRID_DEFAULT_INT = 102
 
 # Used when LANDFIRE is unavailable or returns a non-burnable/unknown class in a
 # region where we still want a demonstrable forecast.
 DEFAULT_FUEL = "GR2"
 
+# Full Scott & Burgan 40 name table (matches LANDFIRE / ForeFire STDfarsiteFuels).
+FBFM40_NAMES: dict[str, str] = {
+    "GR1": "Short, sparse, dry climate grass", "GR2": "Low load, dry climate grass",
+    "GR3": "Low load, very coarse, humid climate grass", "GR4": "Moderate load, dry climate grass",
+    "GR5": "Low load, humid climate grass", "GR6": "Moderate load, humid climate grass",
+    "GR7": "High load, dry climate grass", "GR8": "High load, very coarse, humid climate grass",
+    "GR9": "Very high load, humid climate grass",
+    "GS1": "Low load, dry climate grass-shrub", "GS2": "Moderate load, dry climate grass-shrub",
+    "GS3": "Moderate load, humid climate grass-shrub", "GS4": "High load, humid climate grass-shrub",
+    "SH1": "Low load, dry climate shrub", "SH2": "Moderate load, dry climate shrub",
+    "SH3": "Moderate load, humid climate shrub", "SH4": "Low load, humid climate timber-shrub",
+    "SH5": "High load, dry climate shrub", "SH6": "Low load, humid climate shrub",
+    "SH7": "Very high load, dry climate shrub", "SH8": "High load, humid climate shrub",
+    "SH9": "Very high load, humid climate shrub",
+    "TU1": "Light load, dry climate timber-grass-shrub", "TU2": "Moderate load, humid climate timber-shrub",
+    "TU3": "Moderate load, humid climate timber-grass-shrub", "TU4": "Dwarf conifer with understory",
+    "TU5": "Very high load, dry climate timber-shrub",
+    "TL1": "Low load, compact conifer litter", "TL2": "Low load broadleaf litter",
+    "TL3": "Moderate load conifer litter", "TL4": "Small downed logs",
+    "TL5": "High load conifer litter", "TL6": "High load broadleaf litter",
+    "TL7": "Large downed logs", "TL8": "Long-needle litter", "TL9": "Very high load broadleaf litter",
+    "SB1": "Low load activity fuel", "SB2": "Moderate load activity or low load blowdown",
+    "SB3": "High load activity fuel or moderate load blowdown", "SB4": "High load blowdown",
+}
+
+# FBFM40 burnable code families and the integer base each starts at, so we can
+# turn a LANDFIRE raster pixel value (e.g. 102) back into a code (e.g. "GR2").
+_FBFM40_FAMILIES: dict[str, tuple[int, int]] = {
+    "GR": (101, 9), "GS": (121, 4), "SH": (141, 9),
+    "TU": (161, 5), "TL": (181, 9), "SB": (201, 4),
+}
+
+
+def _fbfm40_int_to_code(value: int) -> Optional[str]:
+    """Map a LANDFIRE FBFM40 raster integer to its Scott & Burgan code.
+    Returns None for non-burnable (91–99) or out-of-range values."""
+    for prefix, (base, count) in _FBFM40_FAMILIES.items():
+        if base <= value < base + count:
+            return f"{prefix}{value - base + 1}"
+    return None
+
 
 def get_params(fuel_code: Optional[str]) -> dict:
-    """Return spread params for a fuel code, falling back to the default model."""
-    if fuel_code and fuel_code in FUEL_MODELS:
-        return {"code": fuel_code, **FUEL_MODELS[fuel_code]}
-    return {"code": DEFAULT_FUEL, **FUEL_MODELS[DEFAULT_FUEL]}
+    """Return {"code", "name"} for a fuel code, falling back to the default model
+    (GR2) for an unknown/None code."""
+    if fuel_code and fuel_code in FBFM40_NAMES:
+        return {"code": fuel_code, "name": FBFM40_NAMES[fuel_code]}
+    return {"code": DEFAULT_FUEL, "name": FBFM40_NAMES[DEFAULT_FUEL]}
 
 
 async def fuel_at(lat: float, lon: float) -> Optional[str]:
     """
     Best-effort LANDFIRE fuel-model code at a point. Returns a Scott & Burgan
-    code string (e.g. 'GR2') or None if the lookup fails. The ArcGIS identify
-    call returns the raster attribute; the exact field name varies by release,
-    so we scan the returned attributes for anything that looks like an FBFM40
-    code before giving up.
+    code string (e.g. 'GR2') or None if the lookup fails or the pixel is
+    non-burnable / no-data (letting the caller fall back to the default).
+
+    The LANDFIRE FBFM40 ImageServer `identify` op returns the raster pixel value
+    as an integer code string (e.g. {"value": "102"}); we map that to a code.
     """
     params = {
-        "geometry": f"{lon},{lat}",
+        "geometry": json.dumps({"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}),
         "geometryType": "esriGeometryPoint",
-        "sr": "4326",
-        "tolerance": "1",
-        "mapExtent": f"{lon-0.01},{lat-0.01},{lon+0.01},{lat+0.01}",
-        "imageDisplay": "100,100,96",
         "returnGeometry": "false",
+        "returnCatalogItems": "false",
         "f": "json",
     }
     try:
         async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
             resp = await client.get(LANDFIRE_FBFM40_IDENTIFY, params=params)
             resp.raise_for_status()
-            results = resp.json().get("results", [])
+            value = resp.json().get("value")
     except Exception:
         return None
 
-    for r in results:
-        attrs = r.get("attributes", {})
-        for value in attrs.values():
-            code = str(value).strip().upper()
-            if code in FUEL_MODELS:
-                return code
-    return None
+    if value in (None, "", "NoData"):
+        return None
+    try:
+        return _fbfm40_int_to_code(int(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fuel_value_to_index(value) -> int:
+    """LANDFIRE raster pixel value → ForeFire fuel index: burnable FBFM40 codes
+    (101–204) pass through; non-burnable (91–99) and no-data become the barrier."""
+    try:
+        iv = int(float(value))
+    except (TypeError, ValueError):
+        return BARRIER_FUEL_INDEX
+    return iv if 101 <= iv <= 204 else BARRIER_FUEL_INDEX
+
+
+async def fuel_grid(
+    west: float, south: float, east: float, north: float, sample_count: int = 900
+) -> Optional[dict]:
+    """
+    A coarse grid of ForeFire fuel indices over a lon/lat bbox, from the LANDFIRE
+    FBFM40 ImageServer `getSamples` op (one call, ~30×30 for a square bbox — about
+    2–3 km cells over a typical fire domain). Burnable fuels are kept; water,
+    urban, rock and no-data become the non-burnable barrier so the fire stops at
+    them.
+
+    Returns {"values": [[int]] (row 0 = south, col 0 = west), "ncols", "nrows",
+    "nonburn_pct"} or None on failure (caller falls back to a uniform fuel map).
+    """
+    geom = {"xmin": west, "ymin": south, "xmax": east, "ymax": north,
+            "spatialReference": {"wkid": 4326}}
+    params = {
+        "geometry": json.dumps(geom),
+        "geometryType": "esriGeometryEnvelope",
+        "sampleCount": str(sample_count),
+        "returnFirstValueOnly": "true",
+        "f": "json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+            resp = await client.get(LANDFIRE_FBFM40_GETSAMPLES, params=params)
+            resp.raise_for_status()
+            samples = resp.json().get("samples", [])
+    except Exception:
+        return None
+    if not samples:
+        return None
+
+    pts = []
+    for s in samples:
+        loc = s.get("location") or {}
+        x, y = loc.get("x"), loc.get("y")
+        if x is not None and y is not None:
+            pts.append((round(x, 5), round(y, 5), s.get("value")))
+    xs = sorted({p[0] for p in pts})
+    ys = sorted({p[1] for p in pts})   # ascending → row 0 = south
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    xi = {x: i for i, x in enumerate(xs)}
+    yi = {y: i for i, y in enumerate(ys)}
+    ncols, nrows = len(xs), len(ys)
+    grid = [[_GRID_DEFAULT_INT] * ncols for _ in range(nrows)]
+    nonburn = 0
+    for x, y, v in pts:
+        code = _fuel_value_to_index(v)
+        grid[yi[y]][xi[x]] = code
+        if code == BARRIER_FUEL_INDEX:
+            nonburn += 1
+    return {
+        "values": grid,
+        "ncols": ncols,
+        "nrows": nrows,
+        "nonburn_pct": 100.0 * nonburn / max(1, len(pts)),
+    }

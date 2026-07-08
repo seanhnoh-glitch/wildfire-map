@@ -20,9 +20,23 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Prediction engine selection: "auto" | "forefire" | "builtin"
-    prediction_engine: str = "auto"
     forefire_binary: str = ""
+    # ForeFire propagation model. "Farsite" pairs with the built-in
+    # STDfarsiteFuelsTable (keyed by LANDFIRE FBFM40 indices) and needs the
+    # moisture params set in forefire_adapter. Other options: "Rothermel",
+    # "WindDriven" — but those expect different fuel tables.
+    forefire_propagation_model: str = "Farsite"
+
+    # Empirical spread-adjustment factor (multiplies the wind the fire sees).
+    # 1.0 = raw model. An earlier 0.5 was calibrated against FIRMS hotspot
+    # footprints (which looked over-predicted ~1.5×) — but validating against
+    # REAL GeoMAC/NIFC perimeters showed that was a proxy artifact: FIRMS
+    # footprints UNDER-represent the true burned area, so the raw model is not
+    # systematically over-predicting (it under-predicts active-growth days vs real
+    # perimeters and over-predicts quiet days — the normal free-spread variance).
+    # So we default to 1.0. See validation/README.md. Per-request `waf_scale`
+    # overrides this.
+    spread_wind_adjust: float = 1.0
 
     # Optional geocoder upgrade
     mapbox_token: str = ""

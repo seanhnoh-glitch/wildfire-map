@@ -29,8 +29,13 @@ WFIGS_PERIMS_URL = (
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query"
 )
-# NASA FIRMS area API: VIIRS S-NPP, last 24h, CSV.
+# NASA FIRMS area API (CSV). We use VIIRS aboard NOAA-20 — the primary
+# operational VIIRS satellite, with a denser/timelier NRT feed than the aging
+# Suomi-NPP. Day range is 2, not 1: NRT for the current day lags a few hours, so
+# a 1-day window often misses hotspots that are actually dated "yesterday".
 FIRMS_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+FIRMS_SOURCE = "VIIRS_NOAA20_NRT"
+FIRMS_DAY_RANGE = 2
 
 # Filter dispatch noise: keep a fire only if it is sizeable OR brand-new/unsized.
 MIN_SIGNIFICANT_ACRES = 10.0
@@ -138,13 +143,37 @@ async def _fetch_hotspots(client: httpx.AsyncClient, lat: float, lon: float, rad
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * max(0.1, abs(math.cos(math.radians(lat)))))
     bbox = f"{lon - dlon},{lat - dlat},{lon + dlon},{lat + dlat}"
-    url = f"{FIRMS_URL}/{key}/VIIRS_SNPP_NRT/{bbox}/1"
+    url = f"{FIRMS_URL}/{key}/{FIRMS_SOURCE}/{bbox}/{FIRMS_DAY_RANGE}"
     try:
         resp = await client.get(url)
         resp.raise_for_status()
         return _firms_csv_to_geojson(resp.text)
     except Exception:
         return None
+
+
+async def hotspots_in_bbox(
+    west: float, south: float, east: float, north: float
+) -> dict[str, Any]:
+    """
+    FIRMS satellite thermal hotspots within a lon/lat bounding box, as GeoJSON.
+    Returns an empty FeatureCollection if no key is configured or the fetch fails
+    (best-effort overlay). Used by the map to show where fires are actively
+    burning right now, in the current viewport.
+    """
+    empty = {"type": "FeatureCollection", "features": []}
+    key = get_settings().firms_map_key
+    if not key:
+        return empty
+    bbox = f"{west},{south},{east},{north}"
+    url = f"{FIRMS_URL}/{key}/{FIRMS_SOURCE}/{bbox}/{FIRMS_DAY_RANGE}"
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return _firms_csv_to_geojson(resp.text)
+        except Exception:
+            return empty
 
 
 def _firms_csv_to_geojson(csv_text: str) -> dict[str, Any]:
@@ -287,10 +316,39 @@ async def perimeters_in_bbox(
 
 
 async def nearest_perimeter_geometry(lat: float, lon: float, radius_km: float = 10.0) -> Optional[dict[str, Any]]:
-    """Return the single closest perimeter polygon geometry, if any, for ignition."""
+    """
+    Return the perimeter geometry belonging to the clicked fire, for ignition.
+
+    Among the mapped perimeters near the point we pick the one that CONTAINS the
+    point (a fire's incident location sits within its own footprint); if none
+    contains it, we pick the genuinely closest. This avoids seeding the forecast
+    from a neighbouring fire's perimeter when several are nearby — which makes the
+    forecast start from the wrong shape.
+    """
+    from shapely.geometry import Point, shape
+
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
         fc = await _fetch_perimeters(client, lat, lon, radius_km)
     feats = fc.get("features") or []
     if not feats:
         return None
-    return feats[0].get("geometry")
+
+    pt = Point(lon, lat)
+    closest_geom = None
+    closest_dist = float("inf")
+    for feat in feats:
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        try:
+            poly = shape(geom)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+        except Exception:
+            continue
+        if poly.contains(pt):
+            return geom                     # point inside → this is the fire's own perimeter
+        d = pt.distance(poly)               # planar degrees; fine for ranking nearby polys
+        if d < closest_dist:
+            closest_dist, closest_geom = d, geom
+    return closest_geom or feats[0].get("geometry")

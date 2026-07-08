@@ -79,6 +79,21 @@ class PredictRequest(BaseModel):
     # If an official perimeter is available, ignite from it instead of a point.
     ignite_from_perimeter: bool = True
 
+    # --- Hindcast / retrospective overrides (used by validation/retrospective) ---
+    # Ignite from this explicit GeoJSON geometry instead of the nearest live
+    # perimeter (so a past fire's T0 footprint can be replayed).
+    ignition_geojson: Optional[dict] = None
+    # Explicit per-step wind [[speed_kmh, dir_from_deg], ...] instead of live
+    # current/forecast wind (so a past window's real wind can be replayed).
+    wind_series: Optional[list[list[float]]] = None
+    # Explicit temperature (°C) + relative humidity (%) for fuel moisture instead
+    # of live weather.
+    temperature_c: Optional[float] = None
+    relative_humidity: Optional[float] = None
+    # Multiply the per-fuel wind adjustment factor (10 m → midflame). 1.0 = default;
+    # >1 lets more wind through (faster spread). For the WAF sensitivity experiment.
+    waf_scale: Optional[float] = None
+
 
 class PredictResponse(BaseModel):
     engine: str = Field(description="Which engine produced this: 'forefire' or 'builtin'")

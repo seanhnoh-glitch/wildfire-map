@@ -9,6 +9,7 @@ Run locally:
 
 Interactive docs at http://localhost:8000/docs
 """
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -17,6 +18,11 @@ from fastapi.responses import FileResponse
 
 from .config import get_settings
 from .routers import fires, geocode, predict, weather
+
+# Ensure our own INFO logs (e.g. ForeFire per-step progress) reach the console.
+# Uvicorn only attaches handlers to its own loggers, so without this the root
+# logger stays silent.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 WEB_DIR = Path(__file__).parent / "web"
 
@@ -52,6 +58,7 @@ async def web_map():
 async def health():
     return {
         "status": "ok",
-        "prediction_engine": settings.prediction_engine,
+        "prediction_engine": "forefire",
+        "forefire_propagation_model": settings.forefire_propagation_model,
         "firms_configured": bool(settings.firms_map_key),
     }

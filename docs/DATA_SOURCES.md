@@ -1,9 +1,9 @@
 # Data Sources & APIs
 
-Every external source this project uses (or is wired to use), what it provides,
-whether it needs a key, and how it feeds the model. All are US-focused, free, and
-public. This is the reference list for the four model ingredients — **fire
-location, fuel, terrain, weather** — plus geocoding and map tiles.
+Every external source this project uses, what it provides, whether it needs a key,
+and how it feeds the model. All are US-focused, free, and public. This is the
+reference list for the four model ingredients — **fire location, fuel, terrain,
+weather** — plus geocoding and map tiles.
 
 Legend: 🔑 needs a (free) key · 🆓 no key · ⏳ wired but not yet fully implemented
 
@@ -13,121 +13,123 @@ Legend: 🔑 needs a (free) key · 🆓 no key · ⏳ wired but not yet fully im
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **NIFC WFIGS — Incident Locations (Current)** 🆓 | Authoritative current US wildfire *points*: name, size (acres), % contained, discovery time, county/state. New fires appear here fastest. | none | `services/fires.py` → `/fires/nearby` |
+| **NIFC WFIGS — Incident Locations (Current)** 🆓 | Authoritative current US wildfire *points*: name, size (acres), % contained, discovery time, county/state. New fires appear here fastest. | none | `services/fires.py` → `/fires/all`, `/fires/nearby` |
 | **NIFC WFIGS — Interagency Perimeters (Current)** 🆓 | Mapped fire *footprints* (polygons). Lags 12–24 h behind the point feed. | none | `services/fires.py` (perimeters + ignition seed) |
-| **NASA FIRMS** 🔑 | Near-real-time satellite thermal *hotspots* (VIIRS/MODIS), ~every few hours. Raw detections, includes fires too new to be in NIFC. | free MAP_KEY | `services/fires.py` (`FIRMS_MAP_KEY`) |
+| **NASA FIRMS** 🔑 | Near-real-time satellite thermal *hotspots* (VIIRS aboard NOAA-20), refreshed every few hours. Raw detections, includes fires too new to be in NIFC. | free MAP_KEY | `services/fires.py` (`FIRMS_MAP_KEY`) → `/hotspots/bbox` |
 
-- WFIGS points ArcGIS endpoint: `services3.arcgis.com/T4QMspbfLg3qTGWY/.../WFIGS_Incident_Locations_Current/FeatureServer/0`
-- FIRMS API + free key: https://firms.modaps.eosdis.nasa.gov/api/area/
-- **How it feeds the model:** the nearest incident point (or its perimeter) is the *ignition* the spread model grows from.
+- FIRMS API + free key: https://firms.modaps.eosdis.nasa.gov/api/map_key/
+- We query `VIIRS_NOAA20_NRT` over a **2-day** window (NRT for the current day
+  lags a few hours, so a 1-day window often misses "yesterday's" detections).
+- **How it feeds the model:** the incident point locates the fire; its NIFC
+  *perimeter* is the ignition footprint the simulation grows from.
 
 ## 2. Fuel — what's burning (most important model input)
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **LANDFIRE FBFM40** 🆓 | 30 m US raster of Scott & Burgan (2005) **40 fire behavior fuel models**, plus canopy cover/height/bulk density and vegetation. The definitive US fuel dataset. | none | `services/fuel.py` (`fuel_at()`), ForeFire landscape |
-| **Scott & Burgan fuel params** (built-in) | Crosswalk from each fuel code → reference rate-of-spread + wind response, consumed by the built-in model. Approximate, literature-informed. | n/a | `services/fuel.py` (`FUEL_MODELS`) |
+| **LANDFIRE 2022 FBFM40** 🆓 | 30 m US raster of Scott & Burgan (2005) **40 fire behavior fuel models** (grass/shrub/timber/slash) plus non-burnable classes (water, urban, rock). The definitive US fuel dataset. | none | `services/fuel.py` |
 
-- LANDFIRE: https://landfire.gov/ · ArcGIS/ImageServer identify used for point lookup.
-- **How it feeds the model:** the fuel code at the fire sets the base spread rate and how strongly wind accelerates it. For ForeFire, a LANDFIRE clip becomes the fuel grid of the NetCDF landscape and maps to `fuels.ff`.
+- ImageServer (CONUS): `lfps.usgs.gov/arcgis/rest/services/Landfire_LF2022/LF2022_FBFM40_CONUS/ImageServer`
+- **Point lookup** (`fuel_at`, `identify` op) → the fuel code at the fire, used to
+  pick the default fuel and its wind adjustment factor.
+- **Domain grid** (`fuel_grid`, `getSamples` op) → a coarse (~30×30, 2–3 km cells)
+  grid of fuel codes across the whole fire domain. Burnable codes (101–204) pass
+  straight into ForeFire's FARSITE fuel table; **water/urban/rock/no-data become a
+  non-burnable "barrier"** (fuel index 999 in `fuel_table.py`) so the fire stops
+  at them instead of crossing them.
+- **How it feeds the model:** ForeFire keys its Rothermel/Farsite rate-of-spread
+  off the fuel code at each cell; barrier cells get a rate of spread of zero.
 
 ## 3. Terrain — slope drives uphill spread
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **Open-Meteo Elevation** 🆓 | Point elevation (Copernicus DEM), used to estimate local slope by sampling a small cross. | none | `services/terrain.py` |
-| **USGS 3DEP** ⏳ | 1–10 m US elevation (DEM). For a full ForeFire pipeline you clip a 3DEP tile as the elevation grid. | none | (ForeFire landscape — see FOREFIRE_SETUP.md) |
-| **OpenTopography** ⏳ | Programmatic DEM clips (SRTM/3DEP) via REST. Alternative to The National Map. | free key for some | (terrain clip) |
+| **Open-Meteo Elevation** 🆓 | Point elevation (Copernicus DEM). We sample a small N/S/E/W cross and take the central-difference gradient → **slope magnitude and uphill aspect (bearing)**. | none | `services/terrain.py` (`slope_aspect_at`) |
+| **USGS 3DEP** ⏳ | 1–10 m US elevation (DEM). A full pipeline would clip a 3DEP tile as a proper elevation grid instead of a point estimate. | none | (future) |
 
-- USGS 3DEP / The National Map: https://apps.nationalmap.gov/ · OpenTopography: https://opentopography.org/
-- **How it feeds the model:** steeper slope → higher head rate of spread (fire runs uphill).
+- **How it feeds the model:** ForeFire's slope layer is a tilted plane whose
+  gradient magnitude equals the local slope and whose uphill direction is the real
+  aspect, so fire runs uphill in the correct direction.
 
 ## 4. Weather — wind is the #1 dynamic driver
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **NWS api.weather.gov** 🆓 | Official US current conditions: wind speed/direction/gust, temp, RH. | none | `services/weather.py` (`current`, primary) |
+| **NWS api.weather.gov** 🆓 | Official US current conditions: wind, temp, RH. | none | `services/weather.py` (`current`, primary) |
 | **Open-Meteo Forecast** 🆓 | Global current + **hourly forecast** wind/temp/RH. `current` fallback AND the source of hourly forecast wind. | none | `services/weather.py` (`current` fallback, `forecast_hourly`) |
-| **NOAA HRRR (via Open-Meteo)** ✅ | 3 km hourly wind *forecast* — the time-evolving driver. Open-Meteo's `best_match` uses HRRR for short-range US, so `forecast_hourly` is HRRR-quality without GRIB parsing. Pin explicitly with `models=ncep_hrrr_conus`. | none | `services/weather.py` (`forecast_hourly`) → time-varying spread |
-| **NOAA HRRR raw grids (NOMADS)** ⏳ | Direct GRIB2 HRRR for higher *spatial* resolution (a wind field, not one point). Needs cfgrib/Herbie. | none | (future: spatial wind field) |
-| **Synoptic / MesoWest (RAWS)** ⏳ | Real-time observed wind from ground stations near the fire. | free tier key | (future: nearest-station wind) |
+| **NOAA HRRR (via Open-Meteo)** ✅ | 3 km hourly wind *forecast*. Open-Meteo's `best_match` uses HRRR for short-range US, so `forecast_hourly` is HRRR-quality without GRIB parsing. | none | `services/weather.py` (`forecast_hourly`) |
+| **NOAA HRRR raw grids (NOMADS)** ⏳ | Direct GRIB2 for a *spatial* wind field (not one point). | none | (future) |
 
-- NWS: https://www.weather.gov/documentation/services-web-api · Open-Meteo: https://open-meteo.com/
-- HRRR via NOMADS: https://nomads.ncep.noaa.gov/ (or the `Herbie` Python library)
-- **How it feeds the model:** wind speed sets head spread rate + ellipse elongation; wind direction sets which way the fire is pushed. Weather reports the direction wind blows *from*; the model pushes the fire the opposite way.
+- **How it feeds the model:**
+  - **Wind** sets rate of spread and which way the fire is pushed. Weather reports
+    the direction wind blows *from*; the model pushes the fire the opposite way.
+    The 10 m forecast wind is reduced to **midflame** wind by a per-fuel adjustment
+    factor before it drives the simulation, then re-triggered each hourly step so
+    the fire **bends as the wind shifts**.
+  - **Temperature + humidity** drive **dead fuel moisture** via the Simard (1968)
+    equilibrium-moisture-content model (drier air → drier fuel → faster spread).
 
 ## 5. Address → coordinates (geocoding)
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **US Census Geocoder** 🆓 | US street address → lat/lon. No key, no rate hassle. | none | `services/geocoding.py` → `/geocode` |
-| **Mapbox / Google Geocoding** ⏳ | Better autocomplete + global coverage. Paid tiers / license terms. | key | (optional swap, same interface) |
+| **US Census Geocoder** 🆓 | US street address → lat/lon. Best for full addresses; no city-only matches. | none | `services/geocoding.py` (primary) |
+| **OpenStreetMap Nominatim** 🆓 | Free-form search (cities, towns, landmarks). Fallback so bare place names resolve. | none | `services/geocoding.py` (fallback) |
 
-- Census: https://geocoding.geo.census.gov/geocoder/
+- Census: https://geocoding.geo.census.gov/geocoder/ · Nominatim: https://nominatim.openstreetmap.org/
 
 ## 6. Map tiles (the base map)
 
 | Source | Provides | Key | Used in |
 |---|---|---|---|
-| **OpenStreetMap raster** 🆓 | Keyless base map for development. **Not** for production traffic (usage policy). | none | `mobile/src/lib/mapStyle.ts` |
-| **MapTiler / Stadia / self-hosted** ⏳ | Production vector/raster tiles, satellite imagery. | key | (swap `tiles` URL) |
+| **OpenStreetMap raster** 🆓 | Keyless base map for development. **Not** for production traffic (usage policy). | none | web `app/web/index.html`; `mobile/src/lib/mapStyle.ts` |
+| **MapTiler / Stadia / self-hosted** ⏳ | Production vector/raster tiles, satellite imagery. | key | (swap the `tiles` URL) |
 
-- Rendering: **MapLibre** (`@maplibre/maplibre-react-native`) — free, no per-tile billing.
+- Rendering: **MapLibre GL** in the web map; `@maplibre/maplibre-react-native` in
+  the mobile app. Free, no per-tile billing, no token.
 
 ---
 
 ## The prediction pipeline (how the pieces combine)
 
 ```
-ignition point (NIFC/FIRMS)
-        │
+NIFC perimeter (or incident point)
+        │  ignition footprint
         ▼
-gather inputs ──► wind      (NWS → Open-Meteo)
-        │         fuel      (LANDFIRE → Scott&Burgan params)
-        │         slope     (Open-Meteo elevation)
+gather inputs ──► wind      (NWS → Open-Meteo, HRRR-backed hourly)
+        │         moisture  (temp + RH → Simard EMC)
+        │         fuel grid (LANDFIRE FBFM40 across the domain, +barriers)
+        │         slope+aspect (Open-Meteo elevation gradient)
         ▼
-engine select (config.PREDICTION_ENGINE)
-   ├── ForeFire (when installed): build NetCDF landscape → simulate → fronts
-   └── built-in elliptical model (default): wind+fuel+slope → nested ellipses
-        │
+ForeFire (spawned subprocess): FARSITE surface spread on the fuel/wind/
+        │  slope layers, seeded from the perimeter, stepped hour by hour
         ▼
-GeoJSON isochrones ──► phone map animates the forecast
+GeoJSON isochrones ──► web map animates the 24 h forecast
 ```
 
-## Built-in model — the math, briefly
+## The ForeFire model — briefly
 
-The fallback/baseline engine (`services/spread_model.py`) is a documented
-**elliptical fire-growth model**:
+`/predict` runs **[ForeFire](https://github.com/forefireAPI/forefire)**, a C++
+front-tracking simulator, via its `pyforefire` bindings (see
+[FOREFIRE_SETUP.md](FOREFIRE_SETUP.md)). Per request, in a clean subprocess,
+`services/forefire_adapter.py`:
 
-- **Head rate of spread** `R_head = R0 · (1 + φ_wind + φ_slope)`, where `R0` is a
-  fuel-specific no-wind baseline, `φ_wind` grows with wind^1.5 scaled by the
-  fuel's wind response, and `φ_slope` grows with steepness. Rothermel-inspired
-  multiplicative form.
-- **Shape:** the front is an ellipse with the ignition point at the rear focus;
-  its length-to-breadth ratio grows with wind speed (Alexander 1985 form),
-  bounded to [1, 8].
-- Each forecast step is one nested ellipse, exported as a GeoJSON polygon tagged
-  with elapsed hours, head distance, and burned area.
+- Sizes a local-metre domain around the fire and lays down four layers:
+  - **fuel** — the LANDFIRE FBFM40 grid, with water/urban/rock as non-burnable
+    barriers, against ForeFire's FARSITE fuel table (`fuel_table.py`);
+  - **wind** — the midflame-reduced forecast wind, re-triggered each step;
+  - **slope** — a plane tilted along the real terrain aspect;
+  - **moisture** — dead fuel moisture from live temperature/humidity.
+- **Ignites** a real `FireFront` traced from the NIFC perimeter (simplified to the
+  working resolution so the shape is preserved), or a small front for a point
+  ignition when no perimeter is nearby.
+- **Steps** the model hour by hour with the `Farsite` (Rothermel-family)
+  propagation model, exporting each step's front as a GeoJSON `Polygon` tagged with
+  `hours`, `head_distance_km`, and `area_km2` — nested isochrones the map animates.
 
-**Time-varying forecast (`simulate_timevarying`).** The default `/predict` path
-does *not* assume one fixed wind. It grows the perimeter incrementally: at each
-hourly step, every point on the front advances outward by that hour's local
-spread rate (elliptical polar form — fastest downwind, slowest backing). Feeding
-the **HRRR-backed hourly wind series** into this makes the fire genuinely **bend
-as the wind shifts**, the same Huygens-wavelet approach FARSITE uses
-(Anderson 1983; Richards 1990). Supply an explicit `wind_speed_kmh` /
-`wind_direction_deg` to hold wind constant instead, or set
-`use_forecast_wind=false`.
+There is **no fallback engine**: if `pyforefire` is unavailable, `/predict` returns
+HTTP 503.
 
-**Ignition from the real footprint.** When a mapped NIFC perimeter exists near the
-requested point (`ignite_from_perimeter`, default on), the forecast starts from
-that polygon — resampled to a star-shaped front about its centroid
-(`perimeter_to_front`) — instead of a seed circle. So a large fire's forecast
-grows outward from its *actual current footprint*. With no perimeter available it
-falls back to point ignition. The response's `parameters.ignition` reports which
-was used.
-
-**References:** Rothermel (1972); Anderson (1983); Alexander (1985);
-Scott & Burgan (2005). This is a research/education tool — **not** operational
-fire-behavior guidance.
-```
+**References:** Rothermel (1972); Andrews (2012, wind adjustment factor);
+Simard (1968, EMC); Scott & Burgan (2005, fuel models); Filippi et al. (ForeFire).
+This is a research/education tool — **not** operational fire-behavior guidance.

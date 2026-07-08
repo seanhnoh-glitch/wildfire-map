@@ -1,0 +1,13 @@
+{
+  "_comment": "Real GeoMAC perimeters (2000-2019) across regions/years/seasons — tests whether the FIRMS-derived 0.5 calibration generalizes vs real mapped perimeters.",
+  "runs": [
+    {"label":"Carr CA 7/25-26","fire":"CARR","year":2018,"state":"CA","t0":"2018-07-25","t1":"2018-07-26"},
+    {"label":"Ranch CA 8/1-2","fire":"RANCH","year":2018,"state":"CA","t0":"2018-08-01","t1":"2018-08-02"},
+    {"label":"Thomas CA 12/5-6","fire":"THOMAS","year":2017,"state":"CA","t0":"2017-12-05","t1":"2017-12-06"},
+    {"label":"Thomas CA 12/8-9","fire":"THOMAS","year":2017,"state":"CA","t0":"2017-12-08","t1":"2017-12-09"},
+    {"label":"Rim CA 8/21-22","fire":"RIM","year":2013,"state":"CA","t0":"2013-08-21","t1":"2013-08-22"},
+    {"label":"Wallow AZ 6/2-3","fire":"WALLOW","year":2011,"state":"AZ","t0":"2011-06-02","t1":"2011-06-03"},
+    {"label":"HighPark CO 6/9-10","fire":"HIGH PARK","year":2012,"state":"CO","t0":"2012-06-09","t1":"2012-06-10"},
+    {"label":"EagleCreek OR 9/4-5","fire":"EAGLE CREEK","year":2017,"state":"OR","t0":"2017-09-04","t1":"2017-09-05"}
+  ]
+}

@@ -1,0 +1,11 @@
+# Keep secrets and cruft out of the image. .env is injected at runtime via
+# `docker run --env-file .env`, not baked in.
+.env
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/

@@ -1,113 +1,135 @@
 # Wildfire Map 🔥🗺️
 
-An interactive mobile map for the US where you enter your address (or use GPS),
-see **active wildfires near you**, tap one, and view a **forecast of where it's
-predicted to spread** over the next hours — driven by live wind, fuel, and terrain.
+An interactive map of **active US wildfires**. Open it, see every ongoing fire and
+its mapped perimeter, tap one, and get a **forecast of where it's predicted to
+spread** over the next 24 hours — driven by a real fire-behavior simulator using
+live wind, fuel, terrain, and moisture.
 
 - **Backend:** FastAPI service that aggregates live fire, weather, fuel, and
-  terrain data and runs the spread prediction.
-- **Mobile:** React Native (Expo) app rendering everything on a MapLibre map.
-- **Prediction:** a built-in wind-driven **elliptical spread model** (works out of
-  the box), with a **ForeFire** engine adapter as the upgrade path.
+  terrain data and runs the spread simulation. It also **serves the web map**.
+- **Web map (primary UI):** a single-page MapLibre map served at `/` — works in
+  any browser, desktop or phone (including iPhone Safari). No build step.
+- **Prediction:** **[ForeFire](https://github.com/forefireAPI/forefire)** — a C++
+  front-tracking fire simulator (Rothermel/Farsite surface spread), run via its
+  `pyforefire` bindings. It is the only prediction engine.
+- **Mobile app** (`mobile/`): an earlier React Native (Expo) client. **Secondary
+  and not actively maintained** — the web map is the primary UI. See the note
+  below.
 
 > ⚠️ Research/education project. Forecasts are **not** operational fire-behavior
 > guidance. In a real emergency follow official sources (InciWeb, Watch Duty,
 > local authorities).
 
-## What's live vs. what's a stub
+## What it does
 
 | Feature | Status |
 |---|---|
-| Address geocoding (US Census) | ✅ live |
-| Nearby active fires (NIFC WFIGS points + perimeters) | ✅ live |
-| Satellite hotspots (NASA FIRMS) | ✅ live *(needs a free key)* |
+| Every active US wildfire nationwide (NIFC WFIGS points) | ✅ live |
+| Mapped fire perimeters, detail-on-demand when you zoom in | ✅ live |
+| Satellite hotspots (NASA FIRMS, VIIRS/NOAA-20) when zoomed in | ✅ live *(needs a free key)* |
 | Live weather / wind (NWS → Open-Meteo) | ✅ live |
-| Fuel model at a point (LANDFIRE) + Scott & Burgan params | ✅ live |
-| Slope estimate (Open-Meteo elevation) | ✅ live |
-| Spread forecast → GeoJSON isochrones (built-in model) | ✅ live |
-| **HRRR-backed hourly forecast wind → time-evolving spread (fire bends as wind shifts)** | ✅ live |
-| **Ignite the forecast from the real NIFC perimeter footprint (not just a point)** | ✅ live |
-| ForeFire engine | 🔌 adapter wired, NetCDF builder pending — see `docs/FOREFIRE_SETUP.md` |
+| Fuel across the fire domain (LANDFIRE FBFM40 grid) | ✅ live |
+| **Water / urban / rock as non-burnable barriers the fire stops at** | ✅ live |
+| Dead-fuel moisture from live humidity/temperature (Simard EMC) | ✅ live |
+| 10 m → midflame wind reduction (per-fuel adjustment factor) | ✅ live |
+| Real terrain slope **and aspect** (uphill direction) | ✅ live |
+| HRRR-backed hourly forecast wind → fire bends as the wind shifts | ✅ live |
+| Ignition from the real NIFC perimeter footprint | ✅ live |
+| ForeFire front-tracking simulation → animated 24 h isochrones | ✅ live |
 
-Full source list: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**.
+Full source list: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**. How the ForeFire
+engine is wired: **[docs/FOREFIRE_SETUP.md](docs/FOREFIRE_SETUP.md)**.
 
-## Quickstart
+## Quickstart (Docker — recommended)
 
-### 1. Backend
+ForeFire's `pyforefire` bindings are compiled from C++ against NetCDF and are
+**not** on PyPI, so the backend runs in Docker (it builds ForeFire for you).
 
 ```bash
 cd backend
-python -m venv .venv
-# Windows:  .venv\Scripts\activate     macOS/Linux:  source .venv/bin/activate
+cp .env.example .env          # then add your free FIRMS_MAP_KEY (optional; for hotspots)
+docker build -t wildfire-map-backend .
+docker run -p 8000:8000 --env-file .env wildfire-map-backend
+```
+
+Open **http://localhost:8000** — that's the map. Interactive API docs at
+**http://localhost:8000/docs**.
+
+Get a free FIRMS key in ~1 min: https://firms.modaps.eosdis.nasa.gov/api/map_key/
+
+### Running locally without Docker (no forecasts)
+
+You can run the API with plain Python, but **`/predict` will return HTTP 503**
+because `pyforefire` isn't installed — everything else (fires, perimeters,
+weather, geocoding, hotspots) works:
+
+```bash
+cd backend
+python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # optional; add FIRMS_MAP_KEY for hotspots
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Open http://localhost:8000/docs for interactive API docs. Quick checks:
-
-```bash
-curl "http://localhost:8000/geocode?address=1600+Pennsylvania+Ave+NW,+Washington,+DC"
-curl "http://localhost:8000/fires/nearby?lat=39.5&lon=-121.6&radius_km=200"
-curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" \
-     -d '{"lat":39.5,"lon":-121.6,"duration_hours":6,"step_minutes":60}'
-```
-
-### 2. Mobile app
-
-The app uses MapLibre native modules, so it needs a **dev build** (not Expo Go):
-
-```bash
-cd mobile
-npm install
-npx expo prebuild            # generates native android/ios projects
-npx expo run:android         # or: npx expo run:ios   (needs Xcode/Android Studio)
-```
-
-Point the app at your backend by setting the API base URL — see
-`mobile/src/lib/config.ts` (Android emulator uses `10.0.2.2`; a physical phone
-needs your laptop's LAN IP, e.g. `EXPO_PUBLIC_API_URL=http://192.168.1.42:8000`).
-
-📖 **Full step-by-step (tooling, emulator, networking, troubleshooting):
-[docs/MOBILE_SETUP.md](docs/MOBILE_SETUP.md).** The map screen targets the
-MapLibre React Native **v11** API (`Map`/`GeoJSONSource`/`Layer`, named exports,
-no access token).
+Run the offline unit tests with `python -m pytest`.
 
 ## API surface
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/geocode?address=` | Address → lat/lon |
-| GET | `/fires/nearby?lat=&lon=&radius_km=` | Active fires + perimeters + hotspots |
+| GET | `/` | The web map (single-page app) |
+| GET | `/geocode?address=` | Address / place → lat/lon |
+| GET | `/fires/all?min_acres=&limit=` | Every active US wildfire (points) |
+| GET | `/perimeters/all?min_acres=` | All mapped perimeters (simplified) |
+| GET | `/perimeters/bbox?west=&south=&east=&north=` | Full-res perimeters in a viewport |
+| GET | `/hotspots/bbox?west=&south=&east=&north=` | FIRMS hotspots in a viewport |
+| GET | `/fires/nearby?lat=&lon=&radius_km=` | Fires + perimeters + hotspots near a point |
 | GET | `/weather?lat=&lon=` | Current wind/temp/RH at a point |
-| POST | `/predict` | Spread forecast → GeoJSON isochrones |
-| GET | `/health` | Status + which engine is active |
+| POST | `/predict` | Spread forecast → GeoJSON isochrones (ForeFire) |
+| GET | `/health` | Status + propagation model |
+
+Example:
+
+```bash
+curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" \
+     -d '{"lat":39.5,"lon":-121.6,"duration_hours":24,"step_minutes":60}'
+```
 
 ## Architecture
 
 ```
-mobile (Expo + MapLibre)
-   │  REST/JSON
+web map  backend/app/web/index.html   (served at /)   ← primary UI
+   │  REST / JSON
    ▼
 backend (FastAPI)
-   ├─ routers/         thin HTTP layer
+   ├─ routers/            thin HTTP layer
    └─ services/
-        geocoding.py   US Census
-        fires.py       NIFC WFIGS + NASA FIRMS
-        weather.py     NWS + Open-Meteo
-        fuel.py        LANDFIRE + Scott&Burgan params
-        terrain.py     Open-Meteo elevation → slope
-        spread_model.py    built-in elliptical model
-        forefire_adapter.py  input gathering + engine selection (+ ForeFire seam)
+        geocoding.py      US Census → OpenStreetMap Nominatim
+        fires.py          NIFC WFIGS points/perimeters + NASA FIRMS hotspots
+        weather.py        NWS → Open-Meteo (current + HRRR-backed hourly)
+        fuel.py           LANDFIRE FBFM40 (point + domain grid) → fuel codes
+        fuel_table.py     FARSITE fuel table + non-burnable barrier row
+        terrain.py        Open-Meteo elevation → slope + aspect
+        spread_model.py   perimeter → shapely polygon (ignition footprint)
+        forefire_adapter.py  gathers inputs, runs ForeFire, returns isochrones
 ```
 
-See `docs/` for the data-source reference, the spread-model math, and the
-ForeFire wiring guide.
+The ForeFire simulation runs in a **fresh spawned subprocess** per request (the
+engine keeps process-global C++ state, so each forecast needs a clean process).
 
-## Roadmap
+## The mobile app (secondary)
 
-1. ✅ ~~Time-evolving forecast using HRRR wind~~ — done (`simulate_timevarying` + `forecast_hourly`).
-2. ✅ ~~Ignite from mapped perimeters instead of a single point~~ — done (`perimeter_to_front`).
-3. Raw NOMADS HRRR GRIB grids for a *spatial* wind field (not one point).
-4. ForeFire NetCDF landscape builder (LANDFIRE + 3DEP clips) — `docs/FOREFIRE_SETUP.md`.
-5. Push notifications when a new fire appears inside a saved radius.
+`mobile/` is a React Native (Expo + MapLibre) client from an earlier phase. It
+still works against the API and benefits from all the backend modeling
+improvements, but it does **not** have the web map's newer UI features (viewport
+hotspots, dots centered on perimeters, the 24 h horizon and color styling). The
+**web map served at `/` is the maintained UI.** Setup, if you want it anyway:
+**[docs/MOBILE_SETUP.md](docs/MOBILE_SETUP.md)**.
+
+## Roadmap ideas
+
+- Full-resolution (30 m) water masking via a LANDFIRE raster export (today's
+  barrier grid is ~2–3 km, so it catches large water but not small ponds).
+- Raw NOMADS HRRR GRIB grids for a *spatial* wind field (not one point).
+- Fuel moisture that also accounts for recent precipitation and diurnal lag
+  (Nelson dead-fuel model), and live fuel moisture from greenness/season.
+- Bring the mobile app to parity, or retire it in favor of the web map.

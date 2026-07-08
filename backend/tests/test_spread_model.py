@@ -1,196 +1,140 @@
 """
-Tests for the built-in spread model. Pure/offline — no network.
+Offline unit tests for the pure (no-network, no-pyforefire) logic:
+geospatial helpers, perimeter parsing, fuel mapping, and the ForeFire input
+math (moisture, wind adjustment, domain sizing, directional extents).
 
-Run:  cd backend && ./.venv/Scripts/python -m pytest   (after: pip install pytest)
+Run:  cd backend && python -m pytest        (after: pip install pytest)
 """
 import math
 
+from app.services import forefire_adapter as fa
+from app.services import fuel as fuel_svc
 from app.services import spread_model as sm
-from app.services.geo import haversine_km, wind_from_to_toward_bearing
+from app.services.fuel_table import BARRIER_FUEL_INDEX, FARSITE_FUEL_TABLE
+from app.services.geo import (
+    haversine_km,
+    local_meters_to_lonlat,
+    lonlat_to_local_meters,
+    wind_from_to_toward_bearing,
+)
 
+
+# --- geo -------------------------------------------------------------------
 
 def test_wind_from_to_toward():
     assert wind_from_to_toward_bearing(270) == 90   # from west -> toward east
     assert wind_from_to_toward_bearing(0) == 180     # from north -> toward south
 
 
-def test_calm_wind_is_near_circular():
-    lb = sm.length_to_breadth(0.0)
-    assert abs(lb - 1.0) < 0.05
-
-
-def test_higher_wind_more_elongated():
-    assert sm.length_to_breadth(40) > sm.length_to_breadth(10) > sm.length_to_breadth(0)
-
-
-def test_head_ros_increases_with_wind_and_slope():
-    base = sm.head_ros_m_per_min(9.0, 1.1, 0, 0)
-    windy = sm.head_ros_m_per_min(9.0, 1.1, 30, 0)
-    steep = sm.head_ros_m_per_min(9.0, 1.1, 30, 40)
-    assert steep > windy > base > 0
-
-
-def test_isochrones_nested_and_pushed_downwind():
-    fc = sm.simulate(
-        lat=34.05, lon=-118.24, duration_hours=6, step_minutes=60,
-        wind_speed_kmh=25, wind_direction_deg=270,  # from west -> pushes east
-        ros_ref=9.0, wind_factor=1.1, slope_percent=0,
-    )
-    feats = fc["features"]
-    assert len(feats) == 6
-    # Head distance grows monotonically.
-    dists = [f["properties"]["head_distance_km"] for f in feats]
-    assert dists == sorted(dists)
-    # The far tip should be east of the ignition longitude (fire pushed east).
-    last_ring = feats[-1]["geometry"]["coordinates"][0]
-    east_tip = max(c[0] for c in last_ring)
-    assert east_tip > -118.24
-    # Ignition sits near the rear (western) edge, not the center.
-    west_tip = min(c[0] for c in last_ring)
-    assert abs(west_tip - (-118.24)) < abs(east_tip - (-118.24))
-
-
-def test_area_positive():
-    fc = sm.simulate(
-        lat=40.0, lon=-120.0, duration_hours=3, step_minutes=60,
-        wind_speed_kmh=15, wind_direction_deg=180,
-        ros_ref=9.0, wind_factor=1.1, slope_percent=5,
-    )
-    assert all(f["properties"]["area_km2"] > 0 for f in fc["features"])
-
-
 def test_haversine_known_distance():
-    # ~roughly one degree of latitude is ~111 km
-    d = haversine_km(34.0, -118.0, 35.0, -118.0)
+    d = haversine_km(34.0, -118.0, 35.0, -118.0)     # ~1 deg lat ~ 111 km
     assert 110 < d < 112
 
 
-# --- Time-varying (Huygens) propagation --------------------------------------
-
-def _tip(feature, axis="lon"):
-    ring = feature["geometry"]["coordinates"][0]
-    i = 0 if axis == "lon" else 1
-    return max(c[i] for c in ring), min(c[i] for c in ring)
+def test_local_meters_roundtrip():
+    dx, dy = lonlat_to_local_meters(39.0, -120.0, -119.99, 39.01)
+    lon, lat = local_meters_to_lonlat(39.0, -120.0, dx, dy)
+    assert abs(lon - (-119.99)) < 1e-6 and abs(lat - 39.01) < 1e-6
 
 
-def test_timevarying_constant_wind_nested_and_downwind():
-    # Constant wind from the west for 6 h -> fire grows eastward, nested.
-    series = [(25.0, 270.0)] * 6
-    fc = sm.simulate_timevarying(
-        lat=34.05, lon=-118.24, wind_series=series,
-        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
-    )
-    feats = fc["features"]
-    assert len(feats) == 6
-    areas = [f["properties"]["area_km2"] for f in feats]
-    assert areas == sorted(areas) and areas[0] > 0            # monotonic growth
-    east_tip, _ = _tip(feats[-1])
-    assert east_tip > -118.24                                 # pushed east
+# --- perimeter geometry ----------------------------------------------------
 
-
-def test_timevarying_windshift_bends_fire_south():
-    # 3 h wind from the west (pushes east), then 3 h from the north (pushes south).
-    shifting = [(25.0, 270.0)] * 3 + [(25.0, 0.0)] * 3
-    steady = [(25.0, 270.0)] * 6
-    fc_shift = sm.simulate_timevarying(
-        lat=34.05, lon=-118.24, wind_series=shifting,
-        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
-    )
-    fc_steady = sm.simulate_timevarying(
-        lat=34.05, lon=-118.24, wind_series=steady,
-        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
-    )
-    # After the shift, the front must reach farther SOUTH than the steady-wind run.
-    _, south_shift = _tip(fc_shift["features"][-1], axis="lat")
-    _, south_steady = _tip(fc_steady["features"][-1], axis="lat")
-    assert south_shift < south_steady - 0.005                 # clearly bent south
-
-
-def _square_polygon(clat, clon, half_deg):
+def _square(clat, clon, half):
     ring = [
-        [clon - half_deg, clat - half_deg],
-        [clon + half_deg, clat - half_deg],
-        [clon + half_deg, clat + half_deg],
-        [clon - half_deg, clat + half_deg],
-        [clon - half_deg, clat - half_deg],
+        [clon - half, clat - half], [clon + half, clat - half],
+        [clon + half, clat + half], [clon - half, clat + half],
+        [clon - half, clat - half],
     ]
     return {"type": "Polygon", "coordinates": [ring]}
 
 
 def test_perimeter_to_polygon_centroid_and_area():
-    geom = _square_polygon(34.0, -118.0, 0.02)
-    parsed = sm.perimeter_to_polygon(geom)
-    assert parsed is not None
-    olat, olon, poly = parsed
+    olat, olon, poly = sm.perimeter_to_polygon(_square(34.0, -118.0, 0.02))
     assert abs(olat - 34.0) < 1e-6 and abs(olon + 118.0) < 1e-6
-    # 0.04deg span -> ~4.4 km NS x ~3.7 km EW -> ~16 km^2.
-    assert 10 < poly.area / 1e6 < 25
+    assert 10 < poly.area / 1e6 < 25          # ~0.04deg square ≈ 16 km²
 
 
 def test_perimeter_multipolygon_picks_largest():
-    small = _square_polygon(34.0, -118.0, 0.005)["coordinates"]
-    big = _square_polygon(34.0, -118.0, 0.03)["coordinates"]
+    small = _square(34.0, -118.0, 0.005)["coordinates"]
+    big = _square(34.0, -118.0, 0.03)["coordinates"]
     geom = {"type": "MultiPolygon", "coordinates": [small, big]}
-    parsed = sm.perimeter_to_polygon(geom)
-    assert parsed is not None
-    _, _, poly = parsed
-    assert poly.area / 1e6 > 20  # chose the big square (~37 km^2), not the small (~1)
+    _, _, poly = sm.perimeter_to_polygon(geom)
+    assert poly.area / 1e6 > 20               # chose the big square, not the small
 
 
-def test_perimeter_seeded_starts_large_and_grows():
-    geom = _square_polygon(34.0, -118.0, 0.02)
-    _, _, poly0 = sm.perimeter_to_polygon(geom)
-    series = [(20.0, 270.0)] * 4
-    peri = sm.simulate_timevarying(
-        lat=34.0, lon=-118.0, wind_series=series, ros_ref=9.0, wind_factor=1.1,
-        slope_percent=0, step_minutes=60, initial_polygon=poly0,
-    )
-    pt = sm.simulate_timevarying(
-        lat=34.0, lon=-118.0, wind_series=series, ros_ref=9.0, wind_factor=1.1,
-        slope_percent=0, step_minutes=60,
-    )
-    peri_areas = [f["properties"]["area_km2"] for f in peri["features"]]
-    assert peri_areas == sorted(peri_areas)                      # grows
-    assert peri["properties"]["seeded_from_perimeter"] is True
-    assert pt["properties"]["seeded_from_perimeter"] is False
-    # Starting from a real footprint yields a larger burned area than a point.
-    assert peri_areas[-1] > pt["features"][-1]["properties"]["area_km2"]
-    assert peri_areas[0] > 10.0                                  # already covers the footprint
+def test_perimeter_to_polygon_rejects_degenerate():
+    assert sm.perimeter_to_polygon({"type": "Polygon", "coordinates": [[[0, 0], [1, 1]]]}) is None
+    assert sm.perimeter_to_polygon(None) is None
 
 
-def test_no_spikes_from_jagged_perimeter():
-    # A star-shaped (very non-convex) perimeter must not blow up into thin spikes:
-    # the grown footprint's area stays within a sane multiple of a convex hull proxy.
-    import math as _m
-    clat, clon, R = 39.0, -111.5, 0.05
-    ring = []
-    for k in range(24):
-        ang = 2 * _m.pi * k / 24
-        r = R if k % 2 == 0 else R * 0.35            # alternating spikes inward
-        ring.append([clon + r * _m.cos(ang), clat + r * _m.sin(ang)])
-    ring.append(ring[0])
-    geom = {"type": "Polygon", "coordinates": [ring]}
-    _, _, poly0 = sm.perimeter_to_polygon(geom)
-    series = [(30.0, 270.0)] * 6
-    fc = sm.simulate_timevarying(
-        lat=clat, lon=clon, wind_series=series, ros_ref=9.0, wind_factor=1.1,
-        slope_percent=0, step_minutes=60, initial_polygon=poly0,
-    )
-    from shapely.geometry import Polygon as _P
-    for f in fc["features"]:
-        ringc = f["geometry"]["coordinates"][0]
-        p = _P(ringc)
-        # A spiky polygon has area far smaller than its convex hull; require the
-        # footprint to fill most of its hull (compact, no thin spokes).
-        assert p.area > 0.55 * p.convex_hull.area
+# --- fuel mapping ----------------------------------------------------------
+
+def test_fbfm40_int_to_code():
+    assert fuel_svc._fbfm40_int_to_code(102) == "GR2"
+    assert fuel_svc._fbfm40_int_to_code(165) == "TU5"
+    assert fuel_svc._fbfm40_int_to_code(204) == "SB4"
+    assert fuel_svc._fbfm40_int_to_code(91) is None     # non-burnable
+    assert fuel_svc._fbfm40_int_to_code(120) is None    # gap
 
 
-def test_timevarying_calm_is_roughly_round():
-    series = [(0.0, 270.0)] * 3
-    fc = sm.simulate_timevarying(
-        lat=40.0, lon=-120.0, wind_series=series,
-        ros_ref=9.0, wind_factor=1.1, slope_percent=0, step_minutes=60,
-    )
-    east, west = _tip(fc["features"][-1])
-    # near-symmetric about the origin longitude when there's no wind
-    assert abs((east + 120.0) + (west + 120.0)) < 0.01
+def test_fuel_value_to_index_barrier():
+    assert fuel_svc._fuel_value_to_index("182") == 182          # burnable passes through
+    assert fuel_svc._fuel_value_to_index("98") == BARRIER_FUEL_INDEX   # water -> barrier
+    assert fuel_svc._fuel_value_to_index("91") == BARRIER_FUEL_INDEX   # urban -> barrier
+    assert fuel_svc._fuel_value_to_index("NoData") == BARRIER_FUEL_INDEX
+
+
+def test_get_params_preserves_code_and_defaults():
+    assert fuel_svc.get_params("TL2") == {"code": "TL2", "name": "Low load broadleaf litter"}
+    assert fuel_svc.get_params(None)["code"] == "GR2"           # unknown -> default
+    assert fuel_svc.get_params("NB1")["code"] == "GR2"          # non-burnable -> default
+
+
+def test_fuel_table_integrity():
+    rows = FARSITE_FUEL_TABLE.strip().splitlines()
+    assert all(len(r.split(";")) == 16 for r in rows)          # header + all rows, 16 cols
+    idxs = {r.split(";")[0] for r in rows[1:]}
+    for code in ["101", "109", "141", "165", "189", "204", str(BARRIER_FUEL_INDEX)]:
+        assert code in idxs                                    # all FBFM40 + barrier present
+
+
+# --- ForeFire input math ---------------------------------------------------
+
+def test_met_wind_to_uv_direction():
+    u, v = fa._met_wind_to_uv(10.0, 270.0)      # wind FROM west blows toward east
+    assert u > 9.9 and abs(v) < 1e-6
+
+
+def test_fuel_moisture_from_humidity():
+    dry = fa._fuel_moisture_from_weather(30.0, 10.0)     # hot & dry
+    humid = fa._fuel_moisture_from_weather(15.0, 90.0)   # cool & humid
+    assert 0 < dry["ones"] < dry["tens"] < dry["hundreds"]
+    assert dry["ones"] < humid["ones"]                   # drier air -> drier fuel
+    assert fa._fuel_moisture_from_weather(None, None) == fa._DEFAULT_MOISTURE
+
+
+def test_wind_adjustment_factor_range():
+    waf_grass = fa._wind_adjustment_factor("GR2")
+    waf_shrub = fa._wind_adjustment_factor("SH5")
+    assert 0.25 < waf_grass < 0.5
+    assert waf_shrub > waf_grass                         # deeper fuel bed -> less reduction
+    assert fa._wind_adjustment_factor("ZZ9") == waf_grass  # unknown -> default depth (GR2-like)
+
+
+def test_domain_extents():
+    from shapely.geometry import Point
+    assert fa._domain_extents(None) == (40_000.0, 2_000.0)      # point ignition
+    half, fire_half = fa._domain_extents(Point(0, 0).buffer(10_000))
+    assert abs(fire_half - 10_000) < 200 and half == 40_000.0   # fits in the floor
+    big_half, _ = fa._domain_extents(Point(0, 0).buffer(80_000))
+    assert big_half == 100_000.0                                # grows: 80k + 20k margin
+
+
+def test_directional_extents_downwind_exceeds_backing():
+    # A ring shifted east; with wind toward the east (90°) downwind > backing.
+    origin_lat, origin_lon = 40.0, -120.0
+    ring = [list(local_meters_to_lonlat(origin_lat, origin_lon, x, y))
+            for x, y in [(6000, 1000), (6000, -1000), (-2000, -1000), (-2000, 1000), (6000, 1000)]]
+    dw, bk, cross = fa._directional_extents(ring, origin_lat, origin_lon, 90.0)
+    assert dw > bk                                              # elongated downwind (east)
+    assert dw > 5.0 and cross > 0
