@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 
-from ..schemas import Fire, NearbyFiresResponse
+from ..schemas import EvacuationRequest, EvacuationResponse, Fire, NearbyFiresResponse
+from ..services import evacuation as evac_svc
 from ..services import fires as fires_svc
 
 router = APIRouter(tags=["fires"])
@@ -79,3 +80,23 @@ async def nearby_fires(
         hotspots=data["hotspots"],
         perimeters=data["perimeters"],
     )
+
+
+@router.post("/evacuation", response_model=EvacuationResponse)
+async def evacuation(req: EvacuationRequest):
+    """
+    Traffic-aware evacuation routes leading away from a fire to a safe destination.
+
+    Pass the fire's forecast spread (the /predict `isochrones`) as `avoid_geojson`
+    so routes avoid where the fire is *going*, not just where it is now. Needs
+    MAPBOX_TOKEN for live-traffic driving directions; without it, safe destinations
+    are still returned so the client can show them.
+    """
+    try:
+        return await evac_svc.plan(
+            lat=req.lat, lon=req.lon,
+            fire_lat=req.fire_lat, fire_lon=req.fire_lon,
+            avoid_geojson=req.avoid_geojson, max_routes=req.max_routes,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Evacuation routing error: {exc}")

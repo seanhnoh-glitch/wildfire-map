@@ -24,7 +24,11 @@
     border-radius:20px 20px 0 0; padding:16px 18px calc(env(safe-area-inset-bottom) + 20px);
     box-shadow:0 -3px 20px rgba(0,0,0,.2); transform:translateY(110%); transition:transform .25s; }
   .sheet.show { transform:translateY(0); }
-  .grip { width:40px; height:4px; background:#ddd; border-radius:2px; margin:0 auto 12px; }
+  /* Tap the grip to minimize the sheet so the full map/routes are visible. */
+  .sheet.show.min { transform:translateY(calc(100% - 46px)); }
+  .grip { width:46px; height:5px; background:#c4c4c4; border-radius:3px; margin:0 auto 12px;
+    cursor:pointer; position:relative; }
+  .grip::before { content:""; position:absolute; inset:-14px -60px; }   /* enlarge tap target */
   .sheet h2 { margin:0 0 4px; font-size:18px; }
   .meta { color:#333; font-size:14px; } .sub { color:#888; font-size:12px; margin-top:2px; }
   .x { position:absolute; top:14px; right:16px; font-size:18px; color:#aaa; }
@@ -39,6 +43,26 @@
   .legend { position:absolute; left:10px; bottom:10px; z-index:4; background:rgba(255,255,255,.9);
     border-radius:10px; padding:8px 10px; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.15); display:none; }
   .legend.show { display:block; } .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:5px; vertical-align:-2px; }
+  .btn.evac { background:#1f7a4d; }
+  .routes { margin-top:12px; }
+  .route { display:flex; align-items:center; gap:10px; padding:10px 11px; border-radius:12px;
+    border:1px solid #eee; margin-top:8px; }
+  .route.warn { border-color:#e0a020; background:#fdf6e8; }
+  .route.selected { border-color:#1f7a4d; box-shadow:0 0 0 2px #1f7a4d; }
+  .route .swatch { width:11px; height:11px; border-radius:50%; flex:none; }
+  .route .rtxt { flex:1; font-size:13px; line-height:1.3; }
+  .route .rtxt b { font-size:14px; } .route .rtxt small { color:#888; display:block; }
+  .badge { display:inline-block; font-size:10px; font-weight:700; padding:1px 7px; border-radius:8px;
+    margin-left:6px; vertical-align:1px; }
+  .badge.official { background:#e3f4ea; color:#1a7a49; }
+  .badge.backup { background:#eee; color:#777; }
+  .route .reta { text-align:right; } .route .reta b { font-size:16px; } .route .reta small { color:#c0392b; display:block; font-size:11px; }
+  .evacnote { font-size:12px; color:#8a6d00; margin-top:8px; }
+  .evacfab { position:absolute; left:50%; transform:translateX(-50%);
+    bottom:calc(env(safe-area-inset-bottom) + 26px); z-index:5; border:0; border-radius:24px;
+    background:#1f7a4d; color:#fff; font-size:15px; font-weight:600; padding:13px 20px;
+    box-shadow:0 4px 14px rgba(0,0,0,.28); }
+  .evacfab:active { background:#1a6640; }
 </style>
 </head>
 <body>
@@ -50,6 +74,10 @@
   <button id="locate" title="Use my location">◎</button>
 </div>
 <div id="toast" class="toast"></div>
+
+<!-- Location-first evacuation: appears once we know where you are and a fire is
+     nearby. Routes you away from the nearest fire — no need to pick one first. -->
+<button id="evacFab" class="evacfab" style="display:none">Plan evacuation route</button>
 
 <div class="legend" id="legend">
   <div><i style="background:#ffd88f"></i>+1h &nbsp; <i style="background:#f5a24a"></i>+12h &nbsp; <i style="background:#ec7048"></i>+24h</div>
@@ -69,6 +97,16 @@
     <input id="hour" type="range" min="1" max="24" step="1" value="24">
     <div class="disc">Research estimate — wind-, fuel-, and terrain-driven ForeFire simulation. Not operational guidance.</div>
   </div>
+  <button class="btn evac" id="evacBtn" style="display:none">Plan evacuation route</button>
+</div>
+
+<!-- Evacuation results (own sheet, so it works with or without a fire selected). -->
+<div id="evacSheet" class="sheet">
+  <div class="grip"></div>
+  <span class="x" id="closeEvac">✕</span>
+  <h2 id="evacTitle">Evacuation route</h2>
+  <div class="sub" id="evacSub"></div>
+  <div class="routes" id="routes"></div>
 </div>
 
 <script>
@@ -91,6 +129,8 @@ map.addControl(new maplibregl.NavigationControl({ showCompass:false }), "bottom-
 const FORECAST_HOURS = 24;
 
 let fires = [], selected = null, prediction = null, origin = null, animTimer = null;
+let watchId = null, routeOrigin = null, rerouting = false;   // live-location tracking state
+let originMode = null;   // 'search' (typed address, pinned) | 'gps' (follows live location)
 function haversineKm(la1, lo1, la2, lo2){ const R=6371, r=Math.PI/180;
   const dLa=(la2-la1)*r, dLo=(lo2-lo1)*r;
   const s=Math.sin(dLa/2)**2 + Math.cos(la1*r)*Math.cos(la2*r)*Math.sin(dLo/2)**2;
@@ -182,6 +222,7 @@ async function loadAllFires(quiet){
   try {
     fires = await jget("/fires/all?min_acres=50&limit=2000");
     applyPerimCenters();   // reposition onto perimeter centers if perimeters are loaded
+    updateEvacFab();       // a location set before fires loaded may now have a nearby fire
     if(!quiet) toast(fires.length + " active wildfires nationwide — tap any dot, or search your area.");
   } catch(e){ if(!quiet) toast("Couldn't load fires: "+e.message); }
 }
@@ -252,8 +293,16 @@ function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout
 
 // Frame a location together with the local cluster of nearby fires so the dots
 // are actually visible, and report how many are nearby. Used by search + GPS.
+// Concern thresholds (km). Grounded in wildfire behavior, not smoke range:
+//  - IMMEDIATE: a fast wind-driven fire + ember spotting can plausibly reach
+//    you within a day at this distance -> act now.
+//  - ALERT: outer bound of realistic personal concern (~40 mi monitoring band).
+const THREAT_IMMEDIATE_KM = 25;
+const THREAT_ALERT_KM = 65;
+
 function frameNearbyFires(lat, lon){
-  const RAD = 160;   // km considered "nearby"
+  showMe(lat, lon);              // drop a marker so you can see exactly where your location is
+  const RAD = THREAT_ALERT_KM;   // km considered "nearby / stay alert"
   const near = fires
     .map(f => ({ f, d: haversineKm(lat, lon, f.lat, f.lon) }))
     .filter(o => o.d <= RAD)
@@ -261,17 +310,23 @@ function frameNearbyFires(lat, lon){
   if (near.length){
     // Include fires within ~2.2x the nearest (the local cluster), so one distant
     // fire doesn't zoom the whole view out.
-    const localR = Math.min(RAD, Math.max(near[0].d * 2.2, 50));
+    const localR = Math.min(RAD, Math.max(near[0].d * 2.2, 30));
     const pts = [[lon, lat], ...near.filter(o => o.d <= localR).slice(0,12).map(o => [o.f.lon, o.f.lat])];
     let m=[Infinity,Infinity], M=[-Infinity,-Infinity];
     pts.forEach(([x,y])=>{ if(x<m[0])m[0]=x; if(y<m[1])m[1]=y; if(x>M[0])M[0]=x; if(y>M[1])M[1]=y; });
-    map.fitBounds([m,M], { padding: 70, maxZoom: 10, duration: 900 });
+    map.fitBounds([m,M], { padding: 70, maxZoom: 11, duration: 900 });
     const n = near.length;
-    toast(`${n} active wildfire${n>1?'s':''} within ${RAD} km — nearest ${near[0].d.toFixed(0)} km away. Tap a dot to forecast.`);
+    const imminent = near.filter(o => o.d <= THREAT_IMMEDIATE_KM).length;
+    if (imminent){
+      toast(`⚠️ ${imminent} wildfire${imminent>1?'s':''} within ${THREAT_IMMEDIATE_KM} km — nearest ${near[0].d.toFixed(0)} km. Tap “Plan evacuation route”.`);
+    } else {
+      toast(`${n} active wildfire${n>1?'s':''} within ${RAD} km — nearest ${near[0].d.toFixed(0)} km. Tap “Plan evacuation route”, or a dot to forecast.`);
+    }
   } else {
     map.flyTo({ center:[lon,lat], zoom:8 });
     toast(`No active wildfires within ${RAD} km — showing your area.`);
   }
+  updateEvacFab();
 }
 
 async function search(){
@@ -280,18 +335,40 @@ async function search(){
   try {
     const g = await jget(`/geocode?address=${encodeURIComponent(v)}`);
     origin = { lat:g.lat, lon:g.lon };
+    originMode = "search";        // a typed address pins the origin; live GPS won't override it
+    // Stop live-follow so GPS can't move the origin off the address you chose.
+    if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null;
+      const lb=document.getElementById("locate"); lb.style.color=""; lb.textContent="◎"; }
     frameNearbyFires(g.lat, g.lon);
   } catch(e){ toast("Address not found. Try 'City, ST'."); }
 }
 
+// Nearest active fire to a point, within maxKm (null if none). Used to offer an
+// evacuation route straight from a location, without picking a fire first.
+function nearestFire(lat, lon, maxKm){
+  let best=null, bestD=Infinity;
+  for(const f of fires){ const d=haversineKm(lat, lon, f.lat, f.lon);
+    if(d<=maxKm && d<bestD){ bestD=d; best=f; } }
+  return best;
+}
+// Show the location-first evacuation button when we have a location AND a fire is
+// near enough to matter — and no sheet is already covering the bottom.
+function updateEvacFab(){
+  const fab=document.getElementById("evacFab");
+  const show = origin && nearestFire(origin.lat, origin.lon, THREAT_ALERT_KM)
+               && !sheet.classList.contains("show") && !evacSheet.classList.contains("show");
+  fab.style.display = show ? "block" : "none";
+}
+
 // --- Fire selection + forecast ---
 const sheet = document.getElementById("sheet");
+const evacSheet = document.getElementById("evacSheet");
 function openSheet(f){
   selected = f; prediction = null;
   clearInterval(animTimer); animTimer = null;
   ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
   document.getElementById("legend").classList.remove("show");
-  document.getElementById("fName").textContent = "🔥 " + f.name;
+  document.getElementById("fName").textContent = f.name;
   const parts = [];
   if (origin) parts.push(`${haversineKm(origin.lat, origin.lon, f.lat, f.lon).toFixed(1)} km away`);
   if (f.size_acres != null) parts.push(`${Number(f.size_acres).toLocaleString()} acres`);
@@ -310,7 +387,16 @@ function openSheet(f){
     btn.disabled = false;
     btn.textContent = "Forecast spread →";
   }
+  // The per-fire evacuate button is hidden until a forecast is run — only then
+  // does it do something the main "Plan evacuation route" button doesn't: route
+  // around the PREDICTED spread, not just the current footprint.
+  const evac = document.getElementById("evacBtn");
+  evac.style.display = "none";
+  evac.disabled = false; evac.textContent = "Plan evacuation route";
+  closeEvacSheet();
+  sheet.classList.remove("min");
   sheet.classList.add("show");
+  updateEvacFab();
   // Zoom to FIT the fire, not a fixed level: real perimeter bounds if we have
   // them, else a box from the acreage. Expanded ~1.8x so the forecast has room to
   // spread beyond the current perimeter without running off-screen.
@@ -322,7 +408,8 @@ function openSheet(f){
 function closeSheet(){ sheet.classList.remove("show"); selected=null;
   clearInterval(animTimer); animTimer=null;
   document.getElementById("legend").classList.remove("show");
-  ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); }); }
+  ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
+  updateEvacFab(); }
 
 document.getElementById("closeSheet").onclick = closeSheet;
 
@@ -353,6 +440,11 @@ async function runForecast(){
     const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
     document.getElementById("fc").style.display = "block";
     document.getElementById("predictBtn").style.display = "none";
+    // Now that we have a predicted spread, offer the spread-aware evacuation —
+    // but only if this fire is actually near your location (within the alert
+    // radius). A distant fire is not something you'd evacuate from here.
+    if(origin && haversineKm(origin.lat, origin.lon, selected.lat, selected.lon) <= THREAT_ALERT_KM)
+      document.getElementById("evacBtn").style.display = "block";
     document.getElementById("legend").classList.add("show");
     animateForecast(maxH);   // sweep from 0h up to the full horizon
   } catch(e){ toast("Forecast failed: "+e.message); btn.disabled=false; btn.textContent="Forecast spread →"; }
@@ -382,6 +474,164 @@ function animateForecast(maxH){
 }
 
 document.getElementById("predictBtn").onclick = runForecast;
+
+// --- Evacuation routing ------------------------------------------------------
+const ROUTE_COLORS = ["#1f7a4d", "#2b6cb0", "#7a4fbf"];   // distinct colors per route
+let selectedRouteIdx = -1;   // which route the user has clicked (-1 = none)
+
+// Classify a destination: an OFFICIAL government / Red Cross designated evacuation
+// place people are meant to go, vs a BACKUP location used when none is available.
+function destBadge(dest){
+  if(dest.source === "FEMA") return { cls:"official", text:"Official shelter · open" };
+  if(dest.category === "shelter") return { cls:"official", text:"Designated assembly point" };
+  return { cls:"backup", text:"Backup location" };
+}
+
+// Highlight one route (list item + its map line), on click. Switches on re-click.
+function selectRoute(i, routes){
+  selectedRouteIdx = i;
+  document.querySelectorAll("#routes .route").forEach((el,j)=> el.classList.toggle("selected", j===i));
+  if(map.getLayer("evac-line")){
+    map.setPaintProperty("evac-line","line-width",["case",["==",["get","idx"], i], 7, 3]);
+    map.setPaintProperty("evac-line","line-opacity",["case",["==",["get","idx"], i], 1, 0.45]);
+  }
+  const b=lineBounds(routes[i].geometry); if(b) map.fitBounds(b,{padding:60,duration:600});
+}
+
+function clearEvac(){
+  // Leaves the "you" dot in place — it marks your location, not a route.
+  ["evac-line","evac-dest"].forEach(id=>{ if(map.getLayer(id)) map.removeLayer(id); });
+  ["evac-lines","evac-dests"].forEach(id=>{ if(map.getSource(id)) map.removeSource(id); });
+  const box=document.getElementById("routes"); box.style.display="none"; box.innerHTML="";
+}
+function fmtMin(m){ if(m==null) return "—"; if(m<60) return Math.round(m)+" min";
+  const h=Math.floor(m/60); return h+"h "+Math.round(m-h*60)+"m"; }
+
+// Open the evacuation results sheet. Slides the fire sheet down (but leaves any
+// forecast overlay on the map) so routes and spread can be seen together.
+function openEvacSheet(fire){
+  sheet.classList.remove("show");
+  const dist = origin ? Math.round(haversineKm(origin.lat, origin.lon, fire.lat, fire.lon)) : null;
+  document.getElementById("evacSub").textContent =
+    "Routes away from " + fire.name + (dist!=null ? ` — ${dist} km from you` : "");
+  evacSheet.classList.remove("min");
+  evacSheet.classList.add("show");
+  updateEvacFab();
+}
+function closeEvacSheet(){
+  evacSheet.classList.remove("show");
+  clearEvac();
+  updateEvacFab();
+}
+
+async function planEvacuation(opts){
+  opts = opts || {};
+  if(!origin){ toast("Set your location first — search a place or tap ◎."); return; }
+  // Route away from the chosen fire, the open fire, or just the nearest one.
+  const target = opts.fire || selected || nearestFire(origin.lat, origin.lon, THREAT_ALERT_KM);
+  if(!target){ toast("No active wildfire near you to evacuate from."); return; }
+  // Only offer evacuation when the fire is close enough to your location to matter.
+  if(haversineKm(origin.lat, origin.lon, target.lat, target.lon) > THREAT_ALERT_KM){
+    if(!opts.auto) toast(`That fire is over ${THREAT_ALERT_KM} km from your location — no evacuation needed from here.`);
+    return;
+  }
+  if(opts.auto){ if(rerouting) return; rerouting = true; }          // avoid overlapping re-plans
+  const fab=document.getElementById("evacFab");
+  if(!opts.auto){ fab.disabled=true; fab.textContent="Finding safe routes…"; toast("Finding safe routes…", 0); }
+  try{
+    const body={ lat:origin.lat, lon:origin.lon, fire_lat:target.lat, fire_lon:target.lon, max_routes:3 };
+    // If a forecast was run for THIS fire, avoid where it's GOING, not just where it is.
+    if(target===selected && prediction && prediction.isochrones) body.avoid_geojson=prediction.isochrones;
+    const res = await jpost("/evacuation", body);
+    routeOrigin = { lat:origin.lat, lon:origin.lon };               // where these routes start from
+    if(!opts.auto){ openEvacSheet(target); hideToast(); }
+    renderRoutes(res, { refit: !opts.auto });                       // don't yank the view on auto re-plan
+  }catch(e){ if(!opts.auto) toast("Evacuation planning failed: "+e.message); }
+  finally{
+    if(opts.auto) rerouting = false;
+    else { fab.disabled=false; fab.textContent="Plan evacuation route"; }
+  }
+}
+
+function renderRoutes(res, opts){
+  opts = opts || {};
+  clearEvac();
+  const box=document.getElementById("routes"); box.style.display="block";
+  const routes=res.routes||[];
+  const shownDests = routes.length ? routes.map(r=>r.destination) : (res.destinations||[]);
+  selectedRouteIdx = -1;   // nothing highlighted until the user picks a route
+  const lineFC={ type:"FeatureCollection", features: routes.map((r,i)=>({
+      type:"Feature",
+      properties:{ idx:i, color: r.passes_near_fire ? "#e0a020" : ROUTE_COLORS[i%ROUTE_COLORS.length] },
+      geometry: r.geometry })) };
+  const destFC={ type:"FeatureCollection", features: shownDests.map(d=>({
+      type:"Feature", properties:{ shelter: d.category==="shelter" },
+      geometry:{ type:"Point", coordinates:[d.lon,d.lat] } })) };
+  if(routes.length){
+    map.addSource("evac-lines",{type:"geojson",data:lineFC});
+    map.addLayer({ id:"evac-line", type:"line", source:"evac-lines",
+      layout:{"line-cap":"round","line-join":"round"},
+      paint:{ "line-color":["get","color"], "line-width":4, "line-opacity":0.85 } });
+  }
+  map.addSource("evac-dests",{type:"geojson",data:destFC});
+  map.addLayer({ id:"evac-dest", type:"circle", source:"evac-dests",
+    paint:{ "circle-radius":6, "circle-color":["case",["get","shelter"],"#1f7a4d","#2b6cb0"],
+      "circle-stroke-width":2, "circle-stroke-color":"#fff" } });
+  showMe(origin.lat, origin.lon);   // make sure your location is marked (the routes start here)
+  if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
+  ["me-halo","me"].forEach(id=>{ if(map.getLayer(id)) map.moveLayer(id); });   // keep the "you" dot on top
+
+  box.innerHTML="";
+  if(!routes.length){
+    box.innerHTML = `<div class="evacnote">No drive routes${res.notes&&res.notes.length? " — "+res.notes[0]:""}. Safe areas are marked on the map.</div>`;
+  }
+  routes.forEach((r,i)=>{
+    const color = r.passes_near_fire ? "#e0a020" : ROUTE_COLORS[i%ROUTE_COLORS.length];
+    const delay = (r.duration_typical_min!=null && r.duration_min - r.duration_typical_min > 3)
+      ? `+${Math.round(r.duration_min - r.duration_typical_min)} min traffic` : "";
+    const tag = r.recommended ? "Recommended" : (r.passes_near_fire ? "⚠️ passes near fire" : "alternate");
+    const dest=r.destination;
+    const badge = destBadge(dest);   // official designated shelter vs backup location
+    const el=document.createElement("div"); el.className = r.passes_near_fire ? "route warn" : "route";
+    el.innerHTML =
+      `<span class="swatch" style="background:${color}"></span>`+
+      `<div class="rtxt"><b>${dest.name}</b><span class="badge ${badge.cls}">${badge.text}</span>`+
+        `<small>${tag} · ${r.distance_km} km${dest.detail? " · "+dest.detail:""}</small></div>`+
+      `<div class="reta"><b>${fmtMin(r.duration_min)}</b>${delay?`<small>${delay}</small>`:""}</div>`;
+    el.onclick = ()=> selectRoute(i, routes);
+    box.appendChild(el);
+  });
+  (res.notes||[]).forEach(n=>{ if(!routes.length && res.notes[0]===n) return;
+    const d=document.createElement("div"); d.className="evacnote"; d.textContent=n; box.appendChild(d); });
+
+  if(opts.refit !== false){
+    const b=fitEvacBounds(routes, shownDests);
+    if(b) map.fitBounds(b,{ padding:{top:80,bottom:evacSheet.offsetHeight+20,left:40,right:40}, maxZoom:13, duration:800 });
+  }
+}
+
+function lineBounds(geom){
+  if(!geom||!geom.coordinates) return null;
+  let m=[Infinity,Infinity],M=[-Infinity,-Infinity];
+  geom.coordinates.forEach(([x,y])=>{ if(x<m[0])m[0]=x; if(y<m[1])m[1]=y; if(x>M[0])M[0]=x; if(y>M[1])M[1]=y; });
+  return isFinite(m[0])?[m,M]:null;
+}
+function fitEvacBounds(routes, dests){
+  let m=[Infinity,Infinity],M=[-Infinity,-Infinity], any=false;
+  const add=(x,y)=>{ any=true; if(x<m[0])m[0]=x; if(y<m[1])m[1]=y; if(x>M[0])M[0]=x; if(y>M[1])M[1]=y; };
+  if(origin) add(origin.lon,origin.lat);
+  routes.forEach(r=> (r.geometry.coordinates||[]).forEach(([x,y])=>add(x,y)));
+  dests.forEach(d=> add(d.lon,d.lat));
+  return any?[m,M]:null;
+}
+document.getElementById("evacBtn").onclick = ()=> planEvacuation();          // from a fire's sheet
+document.getElementById("evacFab").onclick = ()=> planEvacuation();          // location-first (nearest fire)
+document.getElementById("closeEvac").onclick = closeEvacSheet;
+// Tap a sheet's grip handle to minimize it (reveal the full map) / restore it.
+document.querySelectorAll(".sheet .grip").forEach(g=>{
+  g.onclick = ()=> g.closest(".sheet").classList.toggle("min");
+});
+
 // Dragging the slider takes over from the animation.
 document.getElementById("hour").oninput = (e)=>{ clearInterval(animTimer); animTimer=null; applyHour(Number(e.target.value)); };
 document.getElementById("addr").addEventListener("keydown", e=>{ if(e.key==="Enter") search(); });
@@ -410,18 +660,54 @@ map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
 map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");
 map.on("mouseleave","fires-dot",()=> map.getCanvas().style.cursor="");
 
-// Geolocation (note: iOS Safari blocks this over plain http on a LAN IP —
-// use the address box there; it works on localhost / https).
-document.getElementById("locate").onclick = ()=>{
+// --- Live location tracking --------------------------------------------------
+// A blue "you" dot that follows you as you move. While an evacuation is shown,
+// moving far enough silently re-plans the routes from your new position.
+function showMe(lat, lon){
+  const data = { type:"Point", coordinates:[lon,lat] };
+  if(map.getSource("me-src")){ map.getSource("me-src").setData(data); return; }
+  map.addSource("me-src", { type:"geojson", data });
+  map.addLayer({ id:"me-halo", type:"circle", source:"me-src",
+    paint:{ "circle-radius":14, "circle-color":"#1a73e8", "circle-opacity":0.18 } });
+  map.addLayer({ id:"me", type:"circle", source:"me-src",
+    paint:{ "circle-radius":7, "circle-color":"#1a73e8", "circle-stroke-width":3, "circle-stroke-color":"#fff" } });
+}
+function hideMe(){
+  ["me","me-halo"].forEach(id=>{ if(map.getLayer(id)) map.removeLayer(id); });
+  if(map.getSource("me-src")) map.removeSource("me-src");
+}
+function maybeReroute(lat, lon){
+  // Only when evac routes are on screen and we've moved a meaningful distance.
+  if(!routeOrigin || !map.getLayer("evac-line")) return;
+  if(haversineKm(lat, lon, routeOrigin.lat, routeOrigin.lon) > 0.4) planEvacuation({ auto:true });
+}
+
+const locateBtn = document.getElementById("locate");
+function stopTracking(){
+  if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+  if(originMode==="gps"){ originMode=null; hideMe(); }
+  locateBtn.style.color=""; locateBtn.textContent="◎";
+  toast("Location tracking off.");
+}
+function startTracking(){
   if(!navigator.geolocation){ toast("Geolocation unavailable — type an address."); return; }
-  toast("Getting your location…", 0);
-  navigator.geolocation.getCurrentPosition(
-    p=>{ origin={lat:p.coords.latitude, lon:p.coords.longitude};
-         frameNearbyFires(p.coords.latitude, p.coords.longitude); },
-    ()=> toast("Location blocked (needs https on a phone) — type an address instead."),
-    { enableHighAccuracy:false, timeout:12000 }
+  toast("Tracking your location…", 0);
+  originMode = "gps";        // tapping ◎ chooses live GPS as the origin
+  let first = true;
+  watchId = navigator.geolocation.watchPosition(
+    p=>{ if(originMode!=="gps") return;     // a typed address takes precedence over live GPS
+         const lat=p.coords.latitude, lon=p.coords.longitude;
+         origin = { lat, lon }; showMe(lat, lon);
+         if(first){ first=false; frameNearbyFires(lat, lon); }   // recenter once, then just follow
+         else maybeReroute(lat, lon);
+       },
+    ()=>{ toast("Location blocked (needs https on a phone) — type an address instead."); stopTracking(); },
+    { enableHighAccuracy:true, maximumAge:5000, timeout:15000 }
   );
-};
+  locateBtn.style.color="#1a73e8"; locateBtn.textContent="◉";
+}
+// Tap ◎ to start following your location; tap again to stop.
+locateBtn.onclick = ()=>{ if(watchId==null) startTracking(); else stopTracking(); };
 </script>
 </body>
 </html>

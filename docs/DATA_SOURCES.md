@@ -88,6 +88,22 @@ Legend: 🔑 needs a (free) key · 🆓 no key · ⏳ wired but not yet fully im
 - Rendering: **MapLibre GL** in the web map; `@maplibre/maplibre-react-native` in
   the mobile app. Free, no per-tile billing, no token.
 
+## 7. Evacuation routing (route away from the fire)
+
+| Source | Provides | Key | Used in |
+|---|---|---|---|
+| **Mapbox Directions — `driving-traffic`** 🔑 | Turn-by-turn driving routes **with live traffic** + alternatives + typical-vs-current ETA. Each candidate is filtered so any route crossing the fire/forecast polygon is dropped. | free token | `services/evacuation.py` (`MAPBOX_TOKEN`) → `/evacuation` |
+| **FEMA National Shelter System — Open Shelters** 🆓 | Shelters that are **actually open now**, synced from the **American Red Cross** database (refreshed daily + every 20 min). The authoritative "go here" list — sparse on calm days, populated during real evacuations. [gis.fema.gov NSS/OpenShelters](https://gis.fema.gov/arcgis/rest/services/NSS/OpenShelters/FeatureServer/0) | none | `services/evacuation.py` |
+| **OpenStreetMap Overpass** 🆓 | Real named fallbacks near, but clear of, the fire: `emergency=assembly_point`, hospitals, community centres, and **towns/cities/villages**. (OSM `amenity=shelter` is skipped — it's mostly picnic/transit shelters.) | none | `services/evacuation.py` |
+| **Mapbox reverse geocoding** 🔑 | Snaps the geometric fallback points to the **nearest real town** so even the last-resort target has a name. | Mapbox token | `services/evacuation.py` |
+| **Computed safe points** 🆓 | Geometric last resort — points a safe distance away in the "away from fire" directions (then town-snapped), so a route target always exists. | none | `services/evacuation.py` |
+
+- Mapbox token (free ~100k req/mo): https://account.mapbox.com/access-tokens/
+- Destinations are a **hybrid**, best-first: currently-open FEMA/Red Cross shelters →
+  OSM assembly points / hospitals / community centres / towns → geometric points
+  snapped to the nearest town. Without a Mapbox token, `/evacuation` still returns
+  the safe destinations (just no drive routes or town-snapping).
+
 ---
 
 ## The prediction pipeline (how the pieces combine)

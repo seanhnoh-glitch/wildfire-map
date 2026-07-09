@@ -36,6 +36,7 @@ live wind, fuel, terrain, and moisture.
 | HRRR-backed hourly forecast wind → fire bends as the wind shifts | ✅ live |
 | Ignition from the real NIFC perimeter footprint | ✅ live |
 | ForeFire front-tracking simulation → animated 24 h isochrones | ✅ live |
+| **Traffic-aware evacuation routes away from the fire** (Mapbox + FEMA/OSM shelters) | ✅ live *(needs a free Mapbox token for drive routes)* |
 
 Full source list: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**. How the ForeFire
 engine is wired: **[docs/FOREFIRE_SETUP.md](docs/FOREFIRE_SETUP.md)**.
@@ -85,6 +86,7 @@ Run the offline unit tests with `python -m pytest`.
 | GET | `/fires/nearby?lat=&lon=&radius_km=` | Fires + perimeters + hotspots near a point |
 | GET | `/weather?lat=&lon=` | Current wind/temp/RH at a point |
 | POST | `/predict` | Spread forecast → GeoJSON isochrones (ForeFire) |
+| POST | `/evacuation` | Traffic-aware routes away from a fire to a safe destination |
 | GET | `/health` | Status + propagation model |
 
 Example:
@@ -111,6 +113,7 @@ backend (FastAPI)
         terrain.py        Open-Meteo elevation → slope + aspect
         spread_model.py   perimeter → shapely polygon (ignition footprint)
         forefire_adapter.py  gathers inputs, runs ForeFire, returns isochrones
+        evacuation.py     safe destinations (FEMA/OSM) + Mapbox traffic routing
 ```
 
 The ForeFire simulation runs in a **fresh spawned subprocess** per request (the

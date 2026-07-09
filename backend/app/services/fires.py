@@ -112,7 +112,9 @@ async def _fetch_points(client: httpx.AsyncClient, lat: float, lon: float, radiu
     return fires
 
 
-async def _fetch_perimeters(client: httpx.AsyncClient, lat: float, lon: float, radius_km: float) -> dict[str, Any]:
+async def _fetch_perimeters(
+    client: httpx.AsyncClient, lat: float, lon: float, radius_km: float, offset: float = 0.0
+) -> dict[str, Any]:
     params = {
         "where": "1=1",
         "geometry": f"{lon},{lat}",
@@ -126,6 +128,11 @@ async def _fetch_perimeters(client: httpx.AsyncClient, lat: float, lon: float, r
         "outSR": "4326",
         "f": "geojson",
     }
+    # Optional server-side simplification (maxAllowableOffset in degrees). A large
+    # fire's full-resolution perimeter is huge and slow; a simplified footprint is
+    # far faster and plenty for containment/avoidance checks.
+    if offset and offset > 0:
+        params["maxAllowableOffset"] = str(offset)
     try:
         resp = await client.get(WFIGS_PERIMS_URL, params=params)
         resp.raise_for_status()
@@ -315,7 +322,9 @@ async def perimeters_in_bbox(
         return resp.json()
 
 
-async def nearest_perimeter_geometry(lat: float, lon: float, radius_km: float = 10.0) -> Optional[dict[str, Any]]:
+async def nearest_perimeter_geometry(
+    lat: float, lon: float, radius_km: float = 10.0, offset: float = 0.0
+) -> Optional[dict[str, Any]]:
     """
     Return the perimeter geometry belonging to the clicked fire, for ignition.
 
@@ -328,7 +337,7 @@ async def nearest_perimeter_geometry(lat: float, lon: float, radius_km: float = 
     from shapely.geometry import Point, shape
 
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
-        fc = await _fetch_perimeters(client, lat, lon, radius_km)
+        fc = await _fetch_perimeters(client, lat, lon, radius_km, offset=offset)
     feats = fc.get("features") or []
     if not feats:
         return None

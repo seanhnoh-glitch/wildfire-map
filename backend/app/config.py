@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     # overrides this.
     spread_wind_adjust: float = 1.0
 
-    # Optional geocoder upgrade
+    # Mapbox access token. Powers the traffic-aware evacuation routing
+    # (Directions `driving-traffic` profile) and can also upgrade the geocoder.
+    # Without it, /evacuation still returns safe destinations but no drive routes.
     mapbox_token: str = ""
 
     @property

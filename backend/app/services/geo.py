@@ -57,3 +57,31 @@ def wind_from_to_toward_bearing(wind_from_deg: float) -> float:
     way (the direction it blows TOWARD). Returns the toward-bearing in degrees.
     """
     return (wind_from_deg + 180.0) % 360.0
+
+
+def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compass bearing (0=N, clockwise) from point 1 toward point 2, in degrees."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def point_at_distance_bearing(lat: float, lon: float, dist_km: float, bearing_deg: float):
+    """Destination lon/lat reached by travelling `dist_km` along `bearing_deg` from a point."""
+    ang = dist_km / (EARTH_RADIUS_M / 1000.0)          # angular distance in radians
+    brg = math.radians(bearing_deg)
+    phi1, lam1 = math.radians(lat), math.radians(lon)
+    phi2 = math.asin(math.sin(phi1) * math.cos(ang) + math.cos(phi1) * math.sin(ang) * math.cos(brg))
+    lam2 = lam1 + math.atan2(
+        math.sin(brg) * math.sin(ang) * math.cos(phi1),
+        math.cos(ang) - math.sin(phi1) * math.sin(phi2),
+    )
+    return math.degrees(lam2), math.degrees(phi2)      # lon, lat
+
+
+def angle_diff_deg(a: float, b: float) -> float:
+    """Smallest absolute difference between two compass bearings, 0..180."""
+    d = abs((a - b) % 360.0)
+    return min(d, 360.0 - d)

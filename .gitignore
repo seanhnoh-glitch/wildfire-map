@@ -24,6 +24,9 @@ data/
 *.nc
 *.tif
 
+# graphify knowledge-graph output/cache (generated)
+graphify-out/
+
 # OS / editor
 .DS_Store
 Thumbs.db

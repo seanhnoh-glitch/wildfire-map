@@ -12,11 +12,15 @@ from app.services import fuel as fuel_svc
 from app.services import spread_model as sm
 from app.services.fuel_table import BARRIER_FUEL_INDEX, FARSITE_FUEL_TABLE
 from app.services.geo import (
+    angle_diff_deg,
     haversine_km,
+    initial_bearing_deg,
     local_meters_to_lonlat,
     lonlat_to_local_meters,
+    point_at_distance_bearing,
     wind_from_to_toward_bearing,
 )
+from app.services import evacuation as evac
 
 
 # --- geo -------------------------------------------------------------------
@@ -138,3 +142,89 @@ def test_directional_extents_downwind_exceeds_backing():
     dw, bk, cross = fa._directional_extents(ring, origin_lat, origin_lon, 90.0)
     assert dw > bk                                              # elongated downwind (east)
     assert dw > 5.0 and cross > 0
+
+
+# --- evacuation routing (offline pieces) -----------------------------------
+
+def test_initial_bearing_cardinals():
+    assert abs(initial_bearing_deg(37, -119, 38, -119)) < 0.01          # due north
+    assert abs(initial_bearing_deg(37, -119, 37, -118) - 90) < 1.0      # due east
+
+
+def test_point_at_distance_bearing_roundtrip():
+    lon, lat = point_at_distance_bearing(37.0, -119.0, 50.0, 90.0)      # 50 km east
+    assert lat == __import__("pytest").approx(37.0, abs=0.05)
+    assert 49 < haversine_km(37.0, -119.0, lat, lon) < 51
+
+
+def test_angle_diff_wraps():
+    assert angle_diff_deg(350, 10) == 20
+    assert angle_diff_deg(10, 350) == 20
+    assert angle_diff_deg(0, 180) == 180
+
+
+def test_danger_union_from_featurecollection():
+    poly = _square(38.0, -119.0, 0.1)
+    fc = {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": poly}]}
+    geom, centroid = evac._danger_union(fc, None)
+    assert geom is not None
+    assert centroid == __import__("pytest").approx((-119.0, 38.0), abs=1e-6)
+
+
+def test_away_from_fire_destinations_ranked_away():
+    # Fire to the west; user east of it. Safe points should head further east
+    # (away), and a point back toward the fire should rank worse.
+    fire = (-119.0, 38.0)
+    user_lat, user_lon = 38.0, -118.5
+    danger, _ = evac._danger_union(_square(38.0, -119.0, 0.05), None)
+    away = initial_bearing_deg(fire[1], fire[0], user_lat, user_lon)     # ~east
+    assert 60 < away < 120
+    dests = evac._geometric_safe_points(user_lat, user_lon, fire, away)
+    ranked = evac._filter_and_rank_destinations(dests, user_lat, user_lon, fire, danger, away)
+    assert ranked                                                        # something survives
+    # Every kept destination is clear of the fire by the safe buffer.
+    assert all(d["km_from_fire"] >= evac._SAFE_BUFFER_KM for d in ranked)
+    # The best-ranked one heads away from the fire (east-ish), not back toward it.
+    assert angle_diff_deg(ranked[0]["bearing"], away) < 90
+
+
+def test_geom_length_km_handles_mixed_geometry():
+    from shapely.geometry import GeometryCollection, LineString, Point, Polygon
+    ln = LineString([(-119.0, 37.0), (-118.0, 37.0)])          # ~1° lon at 37°N ≈ 89 km
+    L = evac._geom_length_km(ln)
+    assert 85 < L < 92
+    # A GeometryCollection (as line∩polygon can produce) — only the line counts.
+    gc = GeometryCollection([ln, Point(-119.0, 37.0), Polygon([(0, 0), (1, 0), (1, 1)])])
+    assert abs(evac._geom_length_km(gc) - L) < 1e-6
+    assert evac._geom_length_km(None) == 0.0
+
+
+def _danger_hit_km(user_lon, user_lat, route_line, danger):
+    """Replicate _mapbox_routes' danger measure: in-fire route length beyond the
+    depth-aware origin-ignore disk."""
+    from shapely.geometry import Point
+    op = Point(user_lon, user_lat)
+    depth_km = op.distance(danger.boundary) * 111.0 if danger.contains(op) else 0.0
+    ignore = op.buffer((evac._ORIGIN_IGNORE_KM + depth_km) / 111.0)
+    return evac._geom_length_km(route_line.intersection(danger).difference(ignore))
+
+
+def test_route_into_fire_flagged_but_away_route_clear():
+    from shapely.geometry import LineString
+    danger, _ = evac._danger_union(_square(38.0, -119.0, 0.05), None)   # ~11 km box
+    ulon, ulat = -118.85, 38.0                                          # user east of, outside, the fire
+    # Heading further east, away from the fire — never enters it.
+    away = LineString([(ulon, ulat), (-118.4, 38.0)])
+    assert _danger_hit_km(ulon, ulat, away, danger) <= evac._DANGER_HIT_KM
+    # Driving west straight through the fire — flagged.
+    into = LineString([(ulon, ulat), (-119.3, 38.0)])
+    assert _danger_hit_km(ulon, ulat, into, danger) > evac._DANGER_HIT_KM
+
+
+def test_origin_ignore_grows_with_depth_inside_fire():
+    from shapely.geometry import Point
+    danger, _ = evac._danger_union(_square(38.0, -119.0, 0.05), None)
+    assert not danger.contains(Point(-118.8, 38.0))                     # outside -> no allowance
+    center = Point(-119.0, 38.0)
+    assert danger.contains(center)                                     # inside
+    assert center.distance(danger.boundary) * 111.0 > 3.0             # depth allowance is real

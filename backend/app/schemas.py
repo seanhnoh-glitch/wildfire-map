@@ -102,3 +102,42 @@ class PredictResponse(BaseModel):
     # Time-stamped fire fronts as a GeoJSON FeatureCollection (one polygon per step).
     isochrones: dict[str, Any]
     notes: list[str] = []
+
+
+# --- Evacuation routing ------------------------------------------------------
+
+class EvacuationRequest(BaseModel):
+    lat: float = Field(description="The user's current latitude")
+    lon: float = Field(description="The user's current longitude")
+    # Fire reference point, for the "route away from the fire" direction. If omitted
+    # we use the centroid of the danger area.
+    fire_lat: Optional[float] = None
+    fire_lon: Optional[float] = None
+    # Area to avoid: the fire's current perimeter plus, ideally, the forecast spread
+    # (pass the /predict `isochrones`). GeoJSON geometry / Feature / FeatureCollection.
+    # If omitted the nearest live perimeter is fetched and avoided.
+    avoid_geojson: Optional[dict] = None
+    max_routes: int = Field(default=3, ge=1, le=6)
+
+
+class EvacuationRoute(BaseModel):
+    destination: dict[str, Any]
+    geometry: dict[str, Any] = Field(description="GeoJSON LineString of the drive")
+    distance_km: float
+    duration_min: float = Field(description="Drive time WITH current traffic")
+    duration_typical_min: Optional[float] = Field(
+        default=None, description="Typical drive time without live traffic (delay indicator)"
+    )
+    passes_near_fire: bool
+    recommended: bool = False
+    km_from_fire: Optional[float] = None
+
+
+class EvacuationResponse(BaseModel):
+    origin: dict[str, float]
+    away_bearing: float = Field(description="Compass bearing pointing away from the fire")
+    routes: list[EvacuationRoute]
+    destinations: list[dict[str, Any]] = Field(
+        default_factory=list, description="Safe destinations considered (points)"
+    )
+    notes: list[str] = []

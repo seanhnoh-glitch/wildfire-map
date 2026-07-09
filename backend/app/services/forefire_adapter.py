@@ -623,9 +623,10 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     # fire spreads with the slower midflame wind. Multiply the wind fed to the
     # model by the fuel's wind adjustment factor. (We keep the *reported* wind at
     # the 10 m value — this only affects the simulation input.) On top of the WAF
-    # we apply the empirical spread-adjustment calibration (config.spread_wind_adjust,
-    # ~0.5, from validation/) so the free-spread model doesn't over-predict typical
-    # days; a per-request waf_scale overrides it. Clamped so it never exceeds 10 m wind.
+    # we apply the empirical spread-adjustment factor (config.spread_wind_adjust,
+    # default 1.0 = raw model — validating against real GeoMAC perimeters showed no
+    # systematic over-prediction; see validation/README.md). A per-request waf_scale
+    # overrides it. Clamped so it never exceeds the 10 m wind.
     scale = req.waf_scale if req.waf_scale is not None else get_settings().spread_wind_adjust
     waf = max(0.05, min(1.0, _wind_adjustment_factor(fuel_code) * scale))
 
