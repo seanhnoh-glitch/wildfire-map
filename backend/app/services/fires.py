@@ -41,6 +41,14 @@ FIRMS_DAY_RANGE = 2
 MIN_SIGNIFICANT_ACRES = 10.0
 NEW_FIRE_HOURS = 12.0
 
+# Hotspots are only shown when they belong to a KNOWN fire (see hotspots_in_bbox):
+# within this buffer of a mapped perimeter, or within this radius of an active
+# incident point. This drops FIRMS thermal anomalies (industrial/agricultural heat,
+# sun-warmed ground) that aren't the wildfire. Perimeters lag 12-24h, so the buffer
+# is generous enough not to clip the active front that has spread past the last map.
+HOTSPOT_PERIM_BUFFER_KM = 5.0
+HOTSPOT_POINT_RADIUS_KM = 10.0
+
 
 def _hours_since(epoch_ms: Optional[float]) -> Optional[float]:
     if not epoch_ms:
@@ -159,14 +167,94 @@ async def _fetch_hotspots(client: httpx.AsyncClient, lat: float, lon: float, rad
         return None
 
 
+async def _points_in_bbox(
+    client: httpx.AsyncClient, west: float, south: float, east: float, north: float
+) -> list[tuple[float, float]]:
+    """Active WF incident point coordinates (lon, lat) intersecting a bbox."""
+    params = {
+        "where": "IncidentTypeCategory = 'WF' AND FireOutDateTime IS NULL",
+        "geometry": f"{west},{south},{east},{north}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "OBJECTID",
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "f": "geojson",
+    }
+    try:
+        resp = await client.get(WFIGS_POINTS_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+    pts: list[tuple[float, float]] = []
+    for feat in data.get("features", []):
+        coords = (feat.get("geometry") or {}).get("coordinates") or []
+        if len(coords) >= 2 and coords[0] is not None and coords[1] is not None:
+            pts.append((float(coords[0]), float(coords[1])))
+    return pts
+
+
+def _filter_hotspots_to_fires(
+    hot_fc: dict[str, Any], perim_fc: dict[str, Any], points: list[tuple[float, float]]
+) -> dict[str, Any]:
+    """
+    Keep only hotspots that belong to a known fire: inside (or within
+    HOTSPOT_PERIM_BUFFER_KM of) a mapped perimeter, or within
+    HOTSPOT_POINT_RADIUS_KM of an active incident point. Everything else is
+    treated as an unrelated thermal anomaly and dropped.
+    """
+    feats = hot_fc.get("features") or []
+    if not feats:
+        return hot_fc
+
+    from shapely.geometry import Point, shape
+    from shapely.ops import unary_union
+
+    polys = []
+    for f in perim_fc.get("features") or []:
+        geom = f.get("geometry")
+        if not geom:
+            continue
+        try:
+            poly = shape(geom)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            polys.append(poly)
+        except Exception:
+            continue
+    # Buffer in degrees of latitude (~111 km/deg); a few km is well within the
+    # accuracy needed to associate a detection with the fire it belongs to.
+    region = unary_union(polys).buffer(HOTSPOT_PERIM_BUFFER_KM / 111.0) if polys else None
+
+    kept = []
+    for f in feats:
+        try:
+            lon, lat = f["geometry"]["coordinates"][:2]
+        except Exception:
+            continue
+        near = region is not None and region.intersects(Point(lon, lat))
+        if not near:
+            near = any(
+                haversine_km(lat, lon, plat, plon) <= HOTSPOT_POINT_RADIUS_KM
+                for plon, plat in points
+            )
+        if near:
+            kept.append(f)
+    return {"type": "FeatureCollection", "features": kept}
+
+
 async def hotspots_in_bbox(
     west: float, south: float, east: float, north: float
 ) -> dict[str, Any]:
     """
-    FIRMS satellite thermal hotspots within a lon/lat bounding box, as GeoJSON.
-    Returns an empty FeatureCollection if no key is configured or the fetch fails
-    (best-effort overlay). Used by the map to show where fires are actively
-    burning right now, in the current viewport.
+    FIRMS satellite thermal hotspots within a lon/lat bounding box, as GeoJSON,
+    restricted to detections that belong to a known fire (near a mapped perimeter
+    or an active incident point) so unrelated thermal anomalies don't appear as
+    stray dots. Returns an empty FeatureCollection if no key is configured or the
+    fetch fails (best-effort overlay). Used by the map to show where fires are
+    actively burning right now, in the current viewport.
     """
     empty = {"type": "FeatureCollection", "features": []}
     key = get_settings().firms_map_key
@@ -178,9 +266,26 @@ async def hotspots_in_bbox(
         try:
             resp = await client.get(url)
             resp.raise_for_status()
-            return _firms_csv_to_geojson(resp.text)
+            hot_fc = _firms_csv_to_geojson(resp.text)
         except Exception:
             return empty
+        if not hot_fc.get("features"):
+            return hot_fc
+        # Associate detections with known fires. Both lookups are best-effort: if
+        # either fails we fall back to showing the (confidence-filtered) hotspots
+        # rather than hiding real fire activity.
+        perim_fc, points = await asyncio.gather(
+            perimeters_in_bbox(west, south, east, north, min_acres=1.0),
+            _points_in_bbox(client, west, south, east, north),
+            return_exceptions=True,
+        )
+        if isinstance(perim_fc, Exception):
+            perim_fc = {"type": "FeatureCollection", "features": []}
+        if isinstance(points, Exception):
+            points = []
+        if not (perim_fc.get("features") or points):
+            return hot_fc
+        return _filter_hotspots_to_fires(hot_fc, perim_fc, points)
 
 
 def _firms_csv_to_geojson(csv_text: str) -> dict[str, Any]:
@@ -201,6 +306,11 @@ def _firms_csv_to_geojson(csv_text: str) -> dict[str, Any]:
         for name in ("bright_ti4", "confidence", "frp", "acq_date", "acq_time"):
             if name in idx and idx[name] < len(cells):
                 props[name] = cells[idx[name]].strip()
+        # Drop FIRMS low-confidence detections: for VIIRS these are the most likely
+        # false alarms (sun-warmed ground, marginal thermal anomalies) and show up
+        # as stray dots away from any real fire. Keep nominal ("n") and high ("h").
+        if str(props.get("confidence", "")).lower() in ("l", "low"):
+            continue
         features.append({
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [lon, lat]},

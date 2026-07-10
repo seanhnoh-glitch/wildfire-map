@@ -78,6 +78,11 @@ class PredictRequest(BaseModel):
     slope_percent: Optional[float] = None
     # If an official perimeter is available, ignite from it instead of a point.
     ignite_from_perimeter: bool = True
+    # Reported containment (0-100%) of the fire being forecast, if known. At 100%
+    # the fire has a complete control line and won't spread, so the free-spread
+    # forecast is skipped; below 100% it's used to hedge the forecast as a worst
+    # case. Supplied by the client (the map knows it from the fire record).
+    percent_contained: Optional[float] = None
 
     # --- Hindcast / retrospective overrides (used by validation/retrospective) ---
     # Ignite from this explicit GeoJSON geometry instead of the nearest live
@@ -102,6 +107,9 @@ class PredictResponse(BaseModel):
     # Time-stamped fire fronts as a GeoJSON FeatureCollection (one polygon per step).
     isochrones: dict[str, Any]
     notes: list[str] = []
+    # True when no spread forecast was produced because the fire is fully contained
+    # (100%). The isochrones are then empty and the client should say so.
+    contained: bool = False
 
 
 # --- Evacuation routing ------------------------------------------------------

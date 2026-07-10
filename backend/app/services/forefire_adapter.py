@@ -778,8 +778,39 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 
 async def predict(req: PredictRequest) -> PredictResponse:
+    # Containment guard (server-side, so the API can't produce a bogus forecast for
+    # a lined fire regardless of which client calls it). A 100%-contained fire has a
+    # complete control line and is not expected to spread, so a free-spread forecast
+    # is meaningless — skip the simulation (and the expensive input gathering) and
+    # return an explicit "contained" response with empty isochrones.
+    if req.percent_contained is not None and req.percent_contained >= 100:
+        return PredictResponse(
+            engine="forefire",
+            parameters={
+                "origin": {"lat": req.lat, "lon": req.lon},
+                "percent_contained": req.percent_contained,
+            },
+            isochrones={"type": "FeatureCollection", "features": []},
+            notes=[
+                "This fire is reported 100% contained — it has a complete control "
+                "line and no outward spread is expected, so no forecast was run."
+            ],
+            contained=True,
+        )
+
     inputs = await _gather_inputs(req)
     notes = list(inputs["notes"])
+
+    # Partial containment: the free-spread model has no concept of a control line,
+    # so it will overstate growth on the lined portion of the perimeter. We can't
+    # place the line spatially (only a single % is reported), so we keep the physics
+    # honest and flag the forecast as a worst case proportional to containment.
+    if req.percent_contained is not None and req.percent_contained > 0:
+        notes.append(
+            f"This fire is reported {req.percent_contained:.0f}% contained. The "
+            "forecast assumes free spread and does not model control lines, so it "
+            "likely overstates growth along contained edges — read it as a worst case."
+        )
 
     if not _forefire_available():
         raise ForeFireUnavailable(

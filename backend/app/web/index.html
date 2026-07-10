@@ -82,6 +82,10 @@
 <div class="legend" id="legend">
   <div><i style="background:#ffd88f"></i>+1h &nbsp; <i style="background:#f5a24a"></i>+12h &nbsp; <i style="background:#ec7048"></i>+24h</div>
   <div style="margin-top:4px"><i style="background:#b5321f;opacity:.35"></i>current fire footprint</div>
+  <div style="margin-top:4px">
+    <i style="background:#ffe66a;margin-right:1px"></i><i style="background:#ffb020;margin-right:1px"></i><i style="background:#ff7a00;margin-right:1px"></i><i style="background:#f23018;margin-right:1px"></i><i style="background:#a10000"></i>
+    fire intensity (low → extreme, zoom in)
+  </div>
 </div>
 
 <div id="sheet" class="sheet">
@@ -113,12 +117,23 @@
 // Served from the backend, so the API is same-origin — no config, no CORS.
 const API = window.location.origin;
 
-// Keyless OSM raster base map (dev/prototype use).
+// Keyless satellite imagery base map (dev/prototype use) so actual vegetation —
+// forest canopy vs. dry grass/scrub vs. bare ground — is directly visible, with a
+// transparent reference overlay for roads and place names.
 const STYLE = {
   version: 8,
-  sources: { osm: { type:"raster", tiles:["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize:256,
-    attribution:"© OpenStreetMap" } },
-  layers: [{ id:"osm", type:"raster", source:"osm" }]
+  sources: {
+    imagery: { type:"raster", tileSize:256,
+      tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+      attribution:"Imagery © Esri, Maxar, Earthstar Geographics" },
+    labels: { type:"raster", tileSize:256,
+      tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"],
+      attribution:"© Esri" }
+  },
+  layers: [
+    { id:"imagery", type:"raster", source:"imagery" },
+    { id:"labels", type:"raster", source:"labels" }
+  ]
 };
 
 const map = new maplibregl.Map({ container:"map", style:STYLE, center:[-119.4,37.5], zoom:5.2 });
@@ -281,9 +296,18 @@ async function refreshHotspots(){
   try {
     const fc = await jget(`/hotspots/bbox?west=${w}&south=${s}&east=${e}&north=${n}`);
     setSource("hotspots", fc, [
+      // Size + heat-colour each detection by Fire Radiative Power (FRP, MW) — a
+      // direct proxy for how intensely that pixel is burning — so the hottest,
+      // most active parts of the fire stand out from the smouldering edges.
       { id:"hotspots-dot", type:"circle", source:"hotspots", paint:{
-          "circle-radius":3, "circle-color":"#ffd23f", "circle-opacity":0.9,
-          "circle-stroke-color":"#ff5a1f", "circle-stroke-width":0.6 } },
+          "circle-radius":[
+            "interpolate", ["linear"], ["to-number", ["get","frp"], 0],
+            0, 5,  20, 7.5,  75, 10,  200, 14,  500, 18 ],
+          "circle-color":[
+            "interpolate", ["linear"], ["to-number", ["get","frp"], 0],
+            0, "#ffd23f",  20, "#ff9500",  60, "#ff6a00",  150, "#ef2b12",  400, "#9e0000" ],
+          "circle-opacity":0.92,
+          "circle-stroke-color":"#2a0700", "circle-stroke-width":1 } },
     ]);
     if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
   } catch(err){ /* best-effort overlay */ }
@@ -339,6 +363,7 @@ async function search(){
     // Stop live-follow so GPS can't move the origin off the address you chose.
     if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null;
       const lb=document.getElementById("locate"); lb.style.color=""; lb.textContent="◎"; }
+    showMe(g.lat, g.lon);         // drop a location pin at the searched place
     frameNearbyFires(g.lat, g.lon);
   } catch(e){ toast("Address not found. Try 'City, ST'."); }
 }
@@ -417,7 +442,16 @@ async function runForecast(){
   if(!selected) return;
   const btn = document.getElementById("predictBtn"); btn.disabled = true; btn.textContent = "Forecasting…";
   try {
-    prediction = await jpost("/predict", { lat:selected.lat, lon:selected.lon, duration_hours:FORECAST_HOURS, step_minutes:60 });
+    prediction = await jpost("/predict", { lat:selected.lat, lon:selected.lon, duration_hours:FORECAST_HOURS, step_minutes:60,
+      percent_contained:selected.percent_contained });
+    // Fully-contained fires return no forecast (empty isochrones) with a note.
+    if (prediction.contained || !(prediction.isochrones.features||[]).length){
+      document.getElementById("fcInfo").textContent = (prediction.notes && prediction.notes[0])
+        || "No spread forecast: this fire is reported fully contained.";
+      document.getElementById("fc").style.display = "block";
+      btn.disabled = true; btn.textContent = "🛡️ No spread expected";
+      return;
+    }
     const feats = prediction.isochrones.features;
     const maxH = Math.max(...feats.map(f=>f.properties.hours));
     // Time gradient: light (soon) → deep red (full horizon). Stops must ascend,
@@ -574,12 +608,12 @@ function renderRoutes(res, opts){
       paint:{ "line-color":["get","color"], "line-width":4, "line-opacity":0.85 } });
   }
   map.addSource("evac-dests",{type:"geojson",data:destFC});
+  // Safe places are green (shelters a deeper green, backup areas a lighter green).
   map.addLayer({ id:"evac-dest", type:"circle", source:"evac-dests",
-    paint:{ "circle-radius":6, "circle-color":["case",["get","shelter"],"#1f7a4d","#2b6cb0"],
+    paint:{ "circle-radius":7, "circle-color":["case",["get","shelter"],"#1f7a4d","#34a853"],
       "circle-stroke-width":2, "circle-stroke-color":"#fff" } });
   showMe(origin.lat, origin.lon);   // make sure your location is marked (the routes start here)
   if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
-  ["me-halo","me"].forEach(id=>{ if(map.getLayer(id)) map.moveLayer(id); });   // keep the "you" dot on top
 
   box.innerHTML="";
   if(!routes.length){
@@ -660,22 +694,55 @@ map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
 map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");
 map.on("mouseleave","fires-dot",()=> map.getCanvas().style.cursor="");
 
+// Tap a satellite hotspot to read its burning intensity (FRP) and how that
+// ranks — so you can see which part of the fire is most intense, not just where.
+const hotspotPopup = new maplibregl.Popup({ closeButton:true, closeOnClick:true, offset:8 });
+function frpLabel(mw){
+  if(mw >= 200) return "extreme";
+  if(mw >= 75)  return "very high";
+  if(mw >= 20)  return "high";
+  if(mw > 0)    return "moderate";
+  return "low";
+}
+map.on("click","hotspots-dot",(e)=>{
+  const p = e.features[0].properties || {};
+  const frp = Number(p.frp);
+  const bright = Number(p.bright_ti4);
+  const when = [p.acq_date, p.acq_time && String(p.acq_time).padStart(4,"0")]
+    .filter(Boolean).join(" ");
+  const rows = [];
+  if(Number.isFinite(frp)) rows.push(`<b>Intensity (FRP):</b> ${frp.toFixed(1)} MW — ${frpLabel(frp)}`);
+  if(Number.isFinite(bright)) rows.push(`<b>Brightness:</b> ${bright.toFixed(0)} K`);
+  if(p.confidence) rows.push(`<b>Confidence:</b> ${p.confidence}`);
+  if(when) rows.push(`<b>Detected:</b> ${when} UTC`);
+  hotspotPopup.setLngLat(e.lngLat)
+    .setHTML(`<div style="font:12px/1.4 system-ui,sans-serif;color:#222">${rows.join("<br>")}</div>`)
+    .addTo(map);
+});
+map.on("mouseenter","hotspots-dot",()=> map.getCanvas().style.cursor="pointer");
+map.on("mouseleave","hotspots-dot",()=> map.getCanvas().style.cursor="");
+
+// Click empty map (not on a fire, hotspot, or safe place) to dismiss: first close
+// any open panel, then clear a pinned searched location — so you can tap out of it.
+map.on("click",(e)=>{
+  const layers = ["fires-dot","hotspots-dot","evac-dest"].filter(id=>map.getLayer(id));
+  if(layers.length && map.queryRenderedFeatures(e.point,{layers}).length) return;
+  if(sheet.classList.contains("show")){ closeSheet(); return; }
+  if(evacSheet.classList.contains("show")){ closeEvacSheet(); return; }
+  if(originMode==="search"){ hideMe(); origin=null; originMode=null; updateEvacFab(); }
+});
+
 // --- Live location tracking --------------------------------------------------
 // A blue "you" dot that follows you as you move. While an evacuation is shown,
 // moving far enough silently re-plans the routes from your new position.
+// Your location is shown as a location-pin symbol (a marker), so it reads as
+// "this place" rather than a generic dot. A DOM marker also always stays on top.
+let meMarker = null;
 function showMe(lat, lon){
-  const data = { type:"Point", coordinates:[lon,lat] };
-  if(map.getSource("me-src")){ map.getSource("me-src").setData(data); return; }
-  map.addSource("me-src", { type:"geojson", data });
-  map.addLayer({ id:"me-halo", type:"circle", source:"me-src",
-    paint:{ "circle-radius":14, "circle-color":"#1a73e8", "circle-opacity":0.18 } });
-  map.addLayer({ id:"me", type:"circle", source:"me-src",
-    paint:{ "circle-radius":7, "circle-color":"#1a73e8", "circle-stroke-width":3, "circle-stroke-color":"#fff" } });
+  if(meMarker){ meMarker.setLngLat([lon,lat]); return; }
+  meMarker = new maplibregl.Marker({ color:"#1a73e8" }).setLngLat([lon,lat]).addTo(map);
 }
-function hideMe(){
-  ["me","me-halo"].forEach(id=>{ if(map.getLayer(id)) map.removeLayer(id); });
-  if(map.getSource("me-src")) map.removeSource("me-src");
-}
+function hideMe(){ if(meMarker){ meMarker.remove(); meMarker = null; } }
 function maybeReroute(lat, lon){
   // Only when evac routes are on screen and we've moved a meaningful distance.
   if(!routeOrigin || !map.getLayer("evac-line")) return;

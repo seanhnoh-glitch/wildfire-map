@@ -56,6 +56,10 @@ _MAX_DESTINATIONS = 6
 
 _MAPBOX_DIRECTIONS = "https://api.mapbox.com/directions/v5/mapbox/driving-traffic"
 _MAPBOX_GEOCODE = "https://api.mapbox.com/geocoding/v5/mapbox.places"
+# Keyless fallback router (public OSRM demo server). No live traffic and no API
+# key, but it returns real road geometry so drive routes still render when no
+# MAPBOX_TOKEN is configured.
+_OSRM_DIRECTIONS = "https://router.project-osrm.org/route/v1/driving"
 # FEMA National Shelter System — the "Open Shelters" layer: shelters that are
 # ACTUALLY OPEN right now. FEMA syncs it from the American Red Cross shelter
 # database every morning and re-checks every 20 minutes, so during a real
@@ -325,22 +329,55 @@ def _filter_and_rank_destinations(
 # Traffic-aware routing (Mapbox) + danger filtering
 # --------------------------------------------------------------------------- #
 
+def _origin_ignore_region(user_lat: float, user_lon: float, danger):
+    """
+    The stretch of any route near the origin that we ignore when deciding whether
+    it "passes through" the fire. If the user is INSIDE the fire, getting out is
+    unavoidable, so the ignored radius grows with how deep they are (distance to
+    the fire edge); if they're outside, we only tolerate a small clip.
+    """
+    from shapely.geometry import Point
+
+    if danger is None:
+        return None
+    op = Point(user_lon, user_lat)
+    depth_km = op.distance(danger.boundary) * 111.0 if danger.contains(op) else 0.0
+    return op.buffer((_ORIGIN_IGNORE_KM + depth_km) / 111.0)
+
+
+def _route_passes_danger(geom: dict, danger, origin_ignore) -> bool:
+    """True if a route runs through the danger area for more than _DANGER_HIT_KM,
+    ignoring the unavoidable stretch near the origin."""
+    if danger is None:
+        return False
+    from shapely.geometry import shape as shp
+
+    try:
+        inside = shp(geom).intersection(danger)
+        if not inside.is_empty and origin_ignore is not None:
+            inside = inside.difference(origin_ignore)
+        return _geom_length_km(inside) > _DANGER_HIT_KM
+    except Exception:
+        return False
+
+
+def _route_record(dest: dict, geom: dict, distance_m: float, duration_s: float,
+                  duration_typical_s, passes: bool) -> dict:
+    return {
+        "destination": {k: dest[k] for k in ("name", "detail", "lat", "lon", "category", "source")},
+        "geometry": geom,
+        "distance_km": round((distance_m or 0) / 1000.0, 1),
+        "duration_min": round((duration_s or 0) / 60.0, 1),
+        "duration_typical_min": round(duration_typical_s / 60.0, 1) if duration_typical_s else None,
+        "passes_near_fire": passes,
+        "km_from_fire": dest.get("km_from_fire"),
+    }
+
+
 async def _mapbox_routes(
     client: httpx.AsyncClient, token: str, user_lat: float, user_lon: float, dest: dict, danger
 ) -> list[dict]:
-    from shapely.geometry import Point
-    from shapely.geometry import shape as shp
-
-    # Ignore the unavoidable stretch near the origin when deciding if a route
-    # "passes through" the danger area. If the user is INSIDE the fire, getting out
-    # is unavoidable, so the ignored radius grows with how deep they are (distance
-    # to the fire edge); if they're outside, we only tolerate a small clip.
-    origin_ignore = None
-    if danger is not None:
-        op = Point(user_lon, user_lat)
-        depth_km = op.distance(danger.boundary) * 111.0 if danger.contains(op) else 0.0
-        origin_ignore = op.buffer((_ORIGIN_IGNORE_KM + depth_km) / 111.0)
-
+    origin_ignore = _origin_ignore_region(user_lat, user_lon, danger)
     url = f"{_MAPBOX_DIRECTIONS}/{user_lon},{user_lat};{dest['lon']},{dest['lat']}"
     params = {
         "alternatives": "true",
@@ -360,26 +397,38 @@ async def _mapbox_routes(
         geom = rt.get("geometry")
         if not geom:
             continue
-        passes = False
-        if danger is not None:
-            try:
-                inside = shp(geom).intersection(danger)
-                if not inside.is_empty and origin_ignore is not None:
-                    inside = inside.difference(origin_ignore)   # drop the start-near-fire bit
-                passes = _geom_length_km(inside) > _DANGER_HIT_KM
-            except Exception:
-                passes = False
-        routes.append({
-            "destination": {k: dest[k] for k in ("name", "detail", "lat", "lon", "category", "source")},
-            "geometry": geom,
-            "distance_km": round(rt.get("distance", 0) / 1000.0, 1),
-            "duration_min": round(rt.get("duration", 0) / 60.0, 1),
-            "duration_typical_min": (
-                round(rt["duration_typical"] / 60.0, 1) if rt.get("duration_typical") else None
-            ),
-            "passes_near_fire": passes,
-            "km_from_fire": dest.get("km_from_fire"),
-        })
+        routes.append(_route_record(
+            dest, geom, rt.get("distance", 0), rt.get("duration", 0),
+            rt.get("duration_typical"), _route_passes_danger(geom, danger, origin_ignore),
+        ))
+    return routes
+
+
+async def _osrm_routes(
+    client: httpx.AsyncClient, user_lat: float, user_lon: float, dest: dict, danger
+) -> list[dict]:
+    """Keyless driving routes via the public OSRM server (no traffic). Same danger
+    filtering as the Mapbox path so contained routes are still flagged."""
+    origin_ignore = _origin_ignore_region(user_lat, user_lon, danger)
+    url = f"{_OSRM_DIRECTIONS}/{user_lon},{user_lat};{dest['lon']},{dest['lat']}"
+    params = {"alternatives": "true", "overview": "full", "geometries": "geojson"}
+    try:
+        r = await client.get(url, params=params, timeout=20.0)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+    if data.get("code") != "Ok":
+        return []
+    routes = []
+    for rt in data.get("routes", []):
+        geom = rt.get("geometry")
+        if not geom:
+            continue
+        routes.append(_route_record(
+            dest, geom, rt.get("distance", 0), rt.get("duration", 0),
+            None, _route_passes_danger(geom, danger, origin_ignore),
+        ))
     return routes
 
 
@@ -451,25 +500,22 @@ async def plan(
     if not any(d["category"] == "shelter" for d in dests):
         notes.append("No open shelters listed near you — routing to the safest nearby town/facility instead.")
 
-    # 3. Traffic-aware routes to each destination, then drop any that cross the fire.
-    if not token:
-        notes.append("Set MAPBOX_TOKEN to enable live-traffic driving routes.")
-        return {
-            "origin": {"lat": lat, "lon": lon},
-            "away_bearing": round(away_bearing),
-            "routes": [],
-            "destinations": [
-                {k: d[k] for k in ("name", "detail", "lat", "lon", "category", "source",
-                                   "km_from_user", "km_from_fire", "bearing")}
-                for d in dests
-            ],
-            "notes": notes,
-        }
-
+    # 3. Driving routes to each destination, then drop any that cross the fire.
+    #    Prefer Mapbox (live traffic) when a token exists; otherwise fall back to
+    #    the keyless OSRM server so routes still render — just without traffic.
     async with httpx.AsyncClient(headers=_UA) as client:
-        route_groups = await asyncio.gather(
-            *[_mapbox_routes(client, token, lat, lon, d, danger) for d in dests]
-        )
+        if token:
+            route_groups = await asyncio.gather(
+                *[_mapbox_routes(client, token, lat, lon, d, danger) for d in dests]
+            )
+        else:
+            notes.append(
+                "Routes use keyless routing (no live traffic). Set MAPBOX_TOKEN for "
+                "traffic-aware ETAs."
+            )
+            route_groups = await asyncio.gather(
+                *[_osrm_routes(client, lat, lon, d, danger) for d in dests]
+            )
     all_routes = [r for group in route_groups for r in group]
 
     # One best route per destination, clear routes first, then by live ETA.

@@ -27,6 +27,9 @@ data/
 # graphify knowledge-graph output/cache (generated)
 graphify-out/
 
+# ForeFire source + build (compiled locally for pyforefire bindings)
+vendor/
+
 # OS / editor
 .DS_Store
 Thumbs.db
