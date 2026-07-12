@@ -63,6 +63,7 @@
     background:#1f7a4d; color:#fff; font-size:15px; font-weight:600; padding:13px 20px;
     box-shadow:0 4px 14px rgba(0,0,0,.28); }
   .evacfab:active { background:#1a6640; }
+  .evacfab:disabled { background:#8a8f8b; opacity:.85; box-shadow:0 2px 8px rgba(0,0,0,.18); }
 </style>
 </head>
 <body>
@@ -75,8 +76,9 @@
 </div>
 <div id="toast" class="toast"></div>
 
-<!-- Location-first evacuation: appears once we know where you are and a fire is
-     nearby. Routes you away from the nearest fire — no need to pick one first. -->
+<!-- Location-first evacuation: shows once a location is set (searched or GPS). It's
+     greyed out unless a fire is within THREAT_ALERT_KM, and routes away from the
+     nearest such fire — no need to pick a fire first. Hidden while a sheet is open. -->
 <button id="evacFab" class="evacfab" style="display:none">Plan evacuation route</button>
 
 <div class="legend" id="legend">
@@ -237,7 +239,7 @@ async function loadAllFires(quiet){
   try {
     fires = await jget("/fires/all?min_acres=50&limit=2000");
     applyPerimCenters();   // reposition onto perimeter centers if perimeters are loaded
-    updateEvacFab();       // a location set before fires loaded may now have a nearby fire
+    refreshEvac();         // a location set before fires loaded can now find its nearest fire
     if(!quiet) toast(fires.length + " active wildfires nationwide — tap any dot, or search your area.");
   } catch(e){ if(!quiet) toast("Couldn't load fires: "+e.message); }
 }
@@ -350,7 +352,6 @@ function frameNearbyFires(lat, lon){
     map.flyTo({ center:[lon,lat], zoom:8 });
     toast(`No active wildfires within ${RAD} km — showing your area.`);
   }
-  updateEvacFab();
 }
 
 async function search(){
@@ -364,6 +365,7 @@ async function search(){
     if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null;
       const lb=document.getElementById("locate"); lb.style.color=""; lb.textContent="◎"; }
     showMe(g.lat, g.lon);         // drop a location pin at the searched place
+    refreshEvac();                // a location is now set — show/enable the evac button
     frameNearbyFires(g.lat, g.lon);
   } catch(e){ toast("Address not found. Try 'City, ST'."); }
 }
@@ -376,18 +378,47 @@ function nearestFire(lat, lon, maxKm){
     if(d<=maxKm && d<bestD){ bestD=d; best=f; } }
   return best;
 }
-// Show the location-first evacuation button when we have a location AND a fire is
-// near enough to matter — and no sheet is already covering the bottom.
-function updateEvacFab(){
-  const fab=document.getElementById("evacFab");
-  const show = origin && nearestFire(origin.lat, origin.lon, THREAT_ALERT_KM)
-               && !sheet.classList.contains("show") && !evacSheet.classList.contains("show");
-  fab.style.display = show ? "block" : "none";
-}
-
 // --- Fire selection + forecast ---
 const sheet = document.getElementById("sheet");
 const evacSheet = document.getElementById("evacSheet");
+// Bottom sheets are removed from the layout when closed (display:none) rather than
+// left parked off-screen — they only come back when their trigger is clicked again.
+function showSheet(el){
+  el.classList.remove("min");
+  el.style.display = "block";
+  void el.offsetWidth;                 // reflow so the slide-up transition plays from off-screen
+  el.classList.add("show");
+}
+function hideSheet(el){
+  el.classList.remove("show","min");
+  // Remove it once it has slid out; skip if it was reopened during the transition.
+  setTimeout(()=>{ if(!el.classList.contains("show")) el.style.display = "none"; }, 280);
+}
+// The per-fire "Plan evacuation route" button only makes sense once we know WHERE
+// you are: it's hidden until a location is set (searched or GPS), and greyed out
+// unless the selected fire is within THREAT_ALERT_KM of that location.
+function updateEvacBtn(){
+  const evac = document.getElementById("evacBtn");
+  if(!evac) return;
+  if(!selected || !origin){ evac.style.display = "none"; return; }
+  const near = haversineKm(origin.lat, origin.lon, selected.lat, selected.lon) <= THREAT_ALERT_KM;
+  evac.style.display = "block";
+  evac.disabled = !near;
+  evac.textContent = near ? "Plan evacuation route" : `No fire within ${THREAT_ALERT_KM} km`;
+}
+// Location-first floating button: visible whenever a location is set (and no sheet
+// is covering the bottom), greyed out unless a fire is within THREAT_ALERT_KM.
+function updateEvacFab(){
+  const fab = document.getElementById("evacFab");
+  if(!fab) return;
+  const sheetOpen = sheet.classList.contains("show") || evacSheet.classList.contains("show");
+  if(!origin || sheetOpen){ fab.style.display = "none"; return; }
+  const near = nearestFire(origin.lat, origin.lon, THREAT_ALERT_KM);
+  fab.style.display = "block";
+  fab.disabled = !near;
+  fab.textContent = near ? "Plan evacuation route" : `No fire within ${THREAT_ALERT_KM} km`;
+}
+function refreshEvac(){ updateEvacBtn(); updateEvacFab(); }
 function openSheet(f){
   selected = f; prediction = null;
   clearInterval(animTimer); animTimer = null;
@@ -412,16 +443,13 @@ function openSheet(f){
     btn.disabled = false;
     btn.textContent = "Forecast spread →";
   }
-  // The per-fire evacuate button is hidden until a forecast is run — only then
-  // does it do something the main "Plan evacuation route" button doesn't: route
-  // around the PREDICTED spread, not just the current footprint.
-  const evac = document.getElementById("evacBtn");
-  evac.style.display = "none";
-  evac.disabled = false; evac.textContent = "Plan evacuation route";
+  // Evacuation is offered only when we know your location and this fire is close
+  // enough to matter (see updateEvacBtn). Once a forecast is run it upgrades to
+  // routing around the PREDICTED spread (see runForecast, which passes it to avoid).
+  updateEvacBtn();
   closeEvacSheet();
-  sheet.classList.remove("min");
-  sheet.classList.add("show");
-  updateEvacFab();
+  showSheet(sheet);
+  updateEvacFab();          // sheet now covers the bottom — hide the floating button
   // Zoom to FIT the fire, not a fixed level: real perimeter bounds if we have
   // them, else a box from the acreage. Expanded ~1.8x so the forecast has room to
   // spread beyond the current perimeter without running off-screen.
@@ -430,11 +458,12 @@ function openSheet(f){
   if (box) map.fitBounds(expandBounds(box, 1.8), { padding: 50, maxZoom: 12, duration: 800 });
   else map.flyTo({ center:[f.lon,f.lat], zoom:10 });
 }
-function closeSheet(){ sheet.classList.remove("show"); selected=null;
+function closeSheet(){ hideSheet(sheet); selected=null;
   clearInterval(animTimer); animTimer=null;
   document.getElementById("legend").classList.remove("show");
   ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
-  updateEvacFab(); }
+  updateEvacFab();          // bottom is free again — show the floating button if a location is set
+}
 
 document.getElementById("closeSheet").onclick = closeSheet;
 
@@ -474,11 +503,9 @@ async function runForecast(){
     const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
     document.getElementById("fc").style.display = "block";
     document.getElementById("predictBtn").style.display = "none";
-    // Now that we have a predicted spread, offer the spread-aware evacuation —
-    // but only if this fire is actually near your location (within the alert
-    // radius). A distant fire is not something you'd evacuate from here.
-    if(origin && haversineKm(origin.lat, origin.lon, selected.lat, selected.lon) <= THREAT_ALERT_KM)
-      document.getElementById("evacBtn").style.display = "block";
+    // Now that we have a predicted spread, the evacuation routes around it — but the
+    // button still only shows/enables when a location is set and this fire is near.
+    updateEvacBtn();
     document.getElementById("legend").classList.add("show");
     animateForecast(maxH);   // sweep from 0h up to the full horizon
   } catch(e){ toast("Forecast failed: "+e.message); btn.disabled=false; btn.textContent="Forecast spread →"; }
@@ -544,18 +571,17 @@ function fmtMin(m){ if(m==null) return "—"; if(m<60) return Math.round(m)+" mi
 // Open the evacuation results sheet. Slides the fire sheet down (but leaves any
 // forecast overlay on the map) so routes and spread can be seen together.
 function openEvacSheet(fire){
-  sheet.classList.remove("show");
+  hideSheet(sheet);
   const dist = origin ? Math.round(haversineKm(origin.lat, origin.lon, fire.lat, fire.lon)) : null;
   document.getElementById("evacSub").textContent =
     "Routes away from " + fire.name + (dist!=null ? ` — ${dist} km from you` : "");
-  evacSheet.classList.remove("min");
-  evacSheet.classList.add("show");
-  updateEvacFab();
+  showSheet(evacSheet);
+  updateEvacFab();          // results sheet covers the bottom — hide the floating button
 }
 function closeEvacSheet(){
-  evacSheet.classList.remove("show");
+  hideSheet(evacSheet);
   clearEvac();
-  updateEvacFab();
+  updateEvacFab();          // bottom is free again — show the floating button if a location is set
 }
 
 async function planEvacuation(opts){
@@ -570,8 +596,8 @@ async function planEvacuation(opts){
     return;
   }
   if(opts.auto){ if(rerouting) return; rerouting = true; }          // avoid overlapping re-plans
-  const fab=document.getElementById("evacFab");
-  if(!opts.auto){ fab.disabled=true; fab.textContent="Finding safe routes…"; toast("Finding safe routes…", 0); }
+  const trigger=document.getElementById("evacBtn");
+  if(!opts.auto){ if(trigger){ trigger.disabled=true; trigger.textContent="Finding safe routes…"; } toast("Finding safe routes…", 0); }
   try{
     const body={ lat:origin.lat, lon:origin.lon, fire_lat:target.lat, fire_lon:target.lon, max_routes:3 };
     // If a forecast was run for THIS fire, avoid where it's GOING, not just where it is.
@@ -583,7 +609,7 @@ async function planEvacuation(opts){
   }catch(e){ if(!opts.auto) toast("Evacuation planning failed: "+e.message); }
   finally{
     if(opts.auto) rerouting = false;
-    else { fab.disabled=false; fab.textContent="Plan evacuation route"; }
+    else if(trigger){ trigger.disabled=false; trigger.textContent="Plan evacuation route"; }
   }
 }
 
@@ -729,7 +755,7 @@ map.on("click",(e)=>{
   if(layers.length && map.queryRenderedFeatures(e.point,{layers}).length) return;
   if(sheet.classList.contains("show")){ closeSheet(); return; }
   if(evacSheet.classList.contains("show")){ closeEvacSheet(); return; }
-  if(originMode==="search"){ hideMe(); origin=null; originMode=null; updateEvacFab(); }
+  if(originMode==="search"){ hideMe(); origin=null; originMode=null; refreshEvac(); }
 });
 
 // --- Live location tracking --------------------------------------------------
@@ -752,7 +778,7 @@ function maybeReroute(lat, lon){
 const locateBtn = document.getElementById("locate");
 function stopTracking(){
   if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
-  if(originMode==="gps"){ originMode=null; hideMe(); }
+  if(originMode==="gps"){ originMode=null; hideMe(); origin=null; refreshEvac(); }
   locateBtn.style.color=""; locateBtn.textContent="◎";
   toast("Location tracking off.");
 }
@@ -764,7 +790,7 @@ function startTracking(){
   watchId = navigator.geolocation.watchPosition(
     p=>{ if(originMode!=="gps") return;     // a typed address takes precedence over live GPS
          const lat=p.coords.latitude, lon=p.coords.longitude;
-         origin = { lat, lon }; showMe(lat, lon);
+         origin = { lat, lon }; showMe(lat, lon); refreshEvac();
          if(first){ first=false; frameNearbyFires(lat, lon); }   // recenter once, then just follow
          else maybeReroute(lat, lon);
        },
