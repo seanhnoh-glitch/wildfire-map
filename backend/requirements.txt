@@ -16,6 +16,15 @@ shapely>=2.0
 # numpy builds the fuel/wind/elevation arrays passed to pyforefire.
 numpy>=1.24
 
+# Optional ML residual correction (Phase 5, off by default via ML_CORRECTION). Loads
+# a gradient-boosted model (trained by validation/train_correction.py) to rescale the
+# forecast footprint. Absent these, the correction simply no-ops. scikit-learn is
+# PINNED so the model is unpickled by the same version it was trained with (a version
+# skew can silently produce wrong predictions) — retrain with this version if bumped.
+scikit-learn==1.7.2
+pandas>=2.0
+joblib>=1.3
+
 # ForeFire is the prediction engine. pyforefire is NOT on PyPI — it is compiled
 # from the ForeFire C++ source (with netCDF4) in the Docker image; see
 # backend/Dockerfile and docs/FOREFIRE_SETUP.md. Without it, /predict returns 503

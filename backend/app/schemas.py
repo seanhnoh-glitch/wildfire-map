@@ -98,6 +98,20 @@ class PredictRequest(BaseModel):
     # Multiply the per-fuel wind adjustment factor (10 m → midflame). 1.0 = default;
     # >1 lets more wind through (faster spread). For the WAF sensitivity experiment.
     waf_scale: Optional[float] = None
+    # Month (1–12) for seasonal live-fuel moisture (herbaceous cures over the season).
+    # Live forecasts use the current month; hindcasts should pass the fire's month.
+    season_month: Optional[int] = None
+    # Suppression / activity signal in [0,1]: 0 = free-burning, 1 = heavily
+    # suppressed / stalled (control lines holding, minimal recent growth). Damps the
+    # forecast so a lined or quiet fire isn't modelled as free-spreading. If omitted,
+    # it's derived from percent_contained (production) or supplied by the validation
+    # harness from the fire's recent growth momentum.
+    suppression: Optional[float] = None
+    # Recent growth momentum = today's mapped area ÷ the prior day's (>1 growing,
+    # ~1 stalled). A top feature of the ML residual correction (services/ml_correction).
+    # Supply it when known (the map has the fire's recent perimeters); omitted → the
+    # model treats it as missing. Only used when ml_correction is enabled.
+    momentum: Optional[float] = None
 
 
 class PredictResponse(BaseModel):
@@ -110,6 +124,10 @@ class PredictResponse(BaseModel):
     # True when no spread forecast was produced because the fire is fully contained
     # (100%). The isochrones are then empty and the client should say so.
     contained: bool = False
+    # True when no forecast was produced because the fire has no official mapped
+    # perimeter to ignite from (many state/prescribed fires report only a point +
+    # acreage). The isochrones are empty and the client should say it can't be modeled.
+    no_perimeter: bool = False
 
 
 # --- Evacuation routing ------------------------------------------------------

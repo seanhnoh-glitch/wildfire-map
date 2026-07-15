@@ -52,6 +52,32 @@ API = os.environ.get("WILDFIRE_API", "http://localhost:8000")
 _R = 6_371_000.0
 _PIXEL_M = 375.0        # VIIRS pixel ~375 m; buffer each detection by this
 
+# On-disk snapshot cache for the harness's own flaky fetches (GeoMAC perimeters,
+# ERA5 wind/humidity). Once a fire's inputs are cached, every later run replays the
+# identical ground truth and weather — so a code change can be measured without
+# network noise re-rolling the inputs. Delete a file to force a re-fetch.
+_SNAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots", "inputs")
+
+
+def _snap_get(name):
+    p = os.path.join(_SNAP_DIR, name + ".json")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _snap_put(name, obj):
+    try:
+        os.makedirs(_SNAP_DIR, exist_ok=True)
+        tmp = os.path.join(_SNAP_DIR, name + ".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, os.path.join(_SNAP_DIR, name + ".json"))
+    except OSError:
+        pass
+
 
 def _firms_key():
     k = os.environ.get("FIRMS_MAP_KEY")
@@ -120,26 +146,70 @@ def _local_to_geojson(geom_local, olat, olon):
 
 # --- Open-Meteo historical -------------------------------------------------
 
-def _fetch_history(lat, lon, t0, t1):
-    """Hourly wind + temp/RH for [t0, t1] from Open-Meteo's ERA5 archive.
-    Returns (wind_series [[kmh, from_deg], ...], mean_temp_c, mean_rh)."""
+def _fetch_history(lat, lon, t0, t1, wind_source="era5"):
+    """Hourly wind + temp/RH for [t0, t1] from Open-Meteo.
+    Returns (wind_series [[sustained_kmh, from_deg, gust_kmh], ...], mean_temp_c,
+    mean_rh). The gust column lets the caller build a gust-blended effective wind
+    (see _effective_series).
+
+    wind_source:
+      "era5" — ERA5 reanalysis (archive-api, ~31 km, hourly mean; back to 1940).
+               Its mean wind under-represents the run-day wind, which is why we
+               gust-blend it. The only option for pre-2015 fires.
+      "hrrr" — archived HRRR forecasts (historical-forecast-api, ~3 km, from ~2021),
+               the SAME model production uses live — a fairer test on recent fires."""
+    tag = "hrrr" if wind_source == "hrrr" else "era5g"
+    snap = f"{tag}_{lat:.4f}_{lon:.4f}_{t0.isoformat()}_{t1.isoformat()}"
+    cached = _snap_get(snap)
+    if cached is not None:
+        return cached[0], cached[1], cached[2]
     p = {
         "latitude": lat, "longitude": lon,
         "start_date": t0.isoformat(), "end_date": t1.isoformat(),
-        "hourly": "wind_speed_10m,wind_direction_10m,temperature_2m,relative_humidity_2m",
+        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,temperature_2m,relative_humidity_2m",
         "wind_speed_unit": "kmh", "timezone": "UTC",
     }
-    r = httpx.get("https://archive-api.open-meteo.com/v1/archive", params=p, timeout=60.0)
+    if wind_source == "hrrr":
+        p["models"] = "gfs_hrrr"
+        api = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+    else:
+        api = "https://archive-api.open-meteo.com/v1/archive"
+    r = httpx.get(api, params=p, timeout=60.0)
     r.raise_for_status()
     h = r.json().get("hourly", {})
     spd, dr = h.get("wind_speed_10m") or [], h.get("wind_direction_10m") or []
+    gst = h.get("wind_gusts_10m") or []
     temp, rh = h.get("temperature_2m") or [], h.get("relative_humidity_2m") or []
-    series = [[float(s), float(d)] for s, d in zip(spd, dr) if s is not None and d is not None]
+    series = []
+    for i, (s, d) in enumerate(zip(spd, dr)):
+        if s is None or d is None:
+            continue
+        g = gst[i] if i < len(gst) and gst[i] is not None else s
+        series.append([float(s), float(d), float(g)])
     tvals = [t for t in temp if t is not None]
     rvals = [x for x in rh if x is not None]
     mean_t = sum(tvals) / len(tvals) if tvals else None
     mean_rh = sum(rvals) / len(rvals) if rvals else None
+    if series:
+        _snap_put(snap, [series, mean_t, mean_rh])
     return series, mean_t, mean_rh
+
+
+def _effective_series(series, gust_factor):
+    """Collapse [sustained, dir, gust] rows to the [effective_speed, dir] the model
+    drives on: effective = sustained + gust_factor·(gust − sustained). gust_factor=0
+    is pure sustained (the old behaviour); 1.0 is pure gust; ~0.4–0.6 represents the
+    intermittent stronger gusts that actually carry a fire's runs. Rows that are
+    already 2-element pass through unchanged."""
+    gf = gust_factor or 0.0
+    out = []
+    for row in series:
+        if len(row) >= 3:
+            s, d, g = row[0], row[1], row[2]
+            out.append([s + gf * max(0.0, g - s), d])
+        else:
+            out.append([row[0], row[1]])
+    return out
 
 
 # --- core: one hindcast -> metrics dict -----------------------------------
@@ -149,17 +219,22 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 def _forecast_and_score(tag, olat, olon, t0_local, t1_local, t0_geo, series,
                         mean_t, mean_rh, horizon_h, overlay, waf_scale, wind_scale,
-                        t0lbl, t1lbl):
+                        t0lbl, t1lbl, gust_factor=None, suppression=None):
     """Shared core: send the T0 footprint + wind to /predict, score the forecast
     against the T1 footprint, write the overlay, return the metrics dict. Used by
     both the FIRMS-footprint and GeoMAC-perimeter front-ends."""
+    series = _effective_series(series, gust_factor)   # gust-blend, then [speed, dir]
     if wind_scale and wind_scale != 1.0:
         series = [[s * wind_scale, d] for s, d in series]
+    try:
+        season_month = int(str(t0lbl)[5:7])   # t0lbl is "YYYY-MM-DD" → month for seasonal LFM
+    except (ValueError, IndexError):
+        season_month = None
     body = {
         "lat": olat, "lon": olon, "duration_hours": horizon_h, "step_minutes": 60,
         "ignite_from_perimeter": False, "ignition_geojson": t0_geo,
         "wind_series": series, "temperature_c": mean_t, "relative_humidity": mean_rh,
-        "waf_scale": waf_scale,
+        "waf_scale": waf_scale, "season_month": season_month, "suppression": suppression,
     }
     r = httpx.post(f"{API}/predict", json=body, timeout=300.0)
     r.raise_for_status()
@@ -193,7 +268,13 @@ _GEOMAC = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
 def _fetch_geomac(fire, year, t0, t1, state=None):
     """Real mapped perimeters for a past fire from the GeoMAC archive. Returns
     (t0_geojson, t1_geojson) — the largest perimeter on each date. Raises with the
-    available dates if either day is missing."""
+    available dates if either day is missing. Also returns `momentum` = the fire's
+    recent daily growth ratio (T0 acres ÷ most-recent-prior-day acres), a suppression
+    proxy — a fire that has stopped growing is likely being held."""
+    snap = f"geomac_{fire.upper()}_{year}_{t0.isoformat()}_{t1.isoformat()}_{state or ''}"
+    cached = _snap_get(snap)
+    if cached is not None:
+        return cached[0], cached[1], (cached[2] if len(cached) > 2 else None)
     where = f"UPPER(incidentname) LIKE '%{fire.upper()}%'"
     if state:
         where += f" AND state='{state.upper()}'"
@@ -221,11 +302,22 @@ def _fetch_geomac(fire, year, t0, t1, state=None):
         avail = sorted({_date(f).isoformat() for f in feats if _date(f)})
         raise ValueError(f"missing perimeter ({'T0 ' + str(t0) if not f0 else 'T1 ' + str(t1)}); "
                          f"available dates: {avail[:12]}")
-    return f0["geometry"], f1["geometry"]
+
+    # Recent growth momentum: largest perimeter on the most recent date before T0.
+    a0 = f0["properties"].get("gisacres") or 0
+    prior_dates = sorted({d for f in feats if (d := _date(f)) and d < t0}, reverse=True)
+    momentum = None
+    if prior_dates and a0 > 0:
+        pa = max((f["properties"].get("gisacres") or 0) for f in feats if _date(f) == prior_dates[0])
+        if pa > 0:
+            momentum = a0 / pa
+    _snap_put(snap, [f0["geometry"], f1["geometry"], momentum])
+    return f0["geometry"], f1["geometry"], momentum
 
 
 def run_perimeter(fire, year, t0, t1, overlay=None, verbose=True, label=None,
-                  waf_scale=None, wind_scale=None, state=None):
+                  waf_scale=None, wind_scale=None, state=None, gust_factor=None,
+                  wind_source="era5"):
     """Hindcast a past fire day against REAL GeoMAC perimeters (no FIRMS proxy)."""
     from shapely.geometry import shape
     t0d, t1d = (date.fromisoformat(str(d)) for d in (t0, t1))
@@ -235,23 +327,31 @@ def run_perimeter(fire, year, t0, t1, overlay=None, verbose=True, label=None,
     tag = label or f"{fire} {t0}->{t1}"
     if verbose:
         print(f"[{tag}] GeoMAC {year} perimeters ...")
-    t0_geo, t1_geo = _fetch_geomac(fire, year, t0d, t1d, state)
+    t0_geo, t1_geo, momentum = _fetch_geomac(fire, year, t0d, t1d, state)
     g1 = shape(t1_geo)
     if not g1.is_valid:
         g1 = g1.buffer(0)
     olat, olon = g1.centroid.y, g1.centroid.x
     t0_local = _to_local(t0_geo, olat, olon)
     t1_local = _to_local(t1_geo, olat, olon)
-    series, mean_t, mean_rh = _fetch_history(olat, olon, t0d, t1d)
+    series, mean_t, mean_rh = _fetch_history(olat, olon, t0d, t1d, wind_source)
     if not series:
         raise ValueError("no historical wind from Open-Meteo")
+    # Suppression from recent growth momentum: a fire that barely grew the prior day
+    # (ratio → 1) is likely being held → high suppression; one that ~doubled (ratio
+    # ≥ 2) is free-running → none. Unknown momentum → no suppression signal.
+    suppression = None
+    if momentum is not None:
+        suppression = max(0.0, min(1.0, (2.0 - momentum) / 1.0))
     out = overlay or os.path.join(_HERE, f"hindcast_perim_{fire}_{t0}_{t1}_overlay.geojson")
     return _forecast_and_score(tag, olat, olon, t0_local, t1_local, t0_geo, series,
-                               mean_t, mean_rh, horizon_h, out, waf_scale, wind_scale, t0, t1)
+                               mean_t, mean_rh, horizon_h, out, waf_scale, wind_scale, t0, t1,
+                               gust_factor=gust_factor, suppression=suppression)
 
 
 def run_hindcast(bbox, start, t0, t1, sensor="VIIRS_NOAA20_NRT",
-                 overlay=None, verbose=True, label=None, waf_scale=None, wind_scale=None):
+                 overlay=None, verbose=True, label=None, waf_scale=None, wind_scale=None,
+                 gust_factor=None):
     """Hindcast one window and return a metrics dict. Raises ValueError on data
     problems (too few detections, no weather). waf_scale (if set) multiplies the
     backend's wind adjustment factor; wind_scale multiplies the wind series we
@@ -288,13 +388,17 @@ def run_hindcast(bbox, start, t0, t1, sensor="VIIRS_NOAA20_NRT",
               f"forecasting {horizon_h} h ...")
     out = overlay or os.path.join(_HERE, f"hindcast_{t0}_{t1}_overlay.geojson")
     return _forecast_and_score(tag, olat, olon, t0_local, t1_local, t0_geo, series,
-                               mean_t, mean_rh, horizon_h, out, waf_scale, wind_scale, t0, t1)
+                               mean_t, mean_rh, horizon_h, out, waf_scale, wind_scale, t0, t1,
+                               gust_factor=gust_factor)
 
 
-# A run is a FAIR test of the forecast only if the fire is big enough for the
-# FIRMS hotspot proxy to be meaningful, AND it actually moved enough that
-# "assume no change" isn't already near-perfect (else persistence is unbeatable).
-_MIN_OBS_KM2 = 50.0
+# A run is a FAIR test of the forecast only if the fire is big enough to score
+# meaningfully, AND it actually moved enough that "assume no change" isn't already
+# near-perfect (else persistence is unbeatable). The size floor is 15 km² (~3,700
+# acres — a normal, not just giant, fire) for GeoMAC's real mapped perimeters; the
+# noisier FIRMS hotspot proxy really wants ≥ ~50 km², so keep that in mind for
+# FIRMS-mode runs.
+_MIN_OBS_KM2 = 15.0
 _MAX_BASE_JACCARD = 0.85
 
 
@@ -327,12 +431,14 @@ def _print_single(res):
 
 def cmd_run(args):
     _print_single(run_hindcast(args.bbox, args.start, args.t0, args.t1, args.sensor,
-                               args.overlay, waf_scale=args.waf_scale, wind_scale=args.wind_scale))
+                               args.overlay, waf_scale=args.waf_scale, wind_scale=args.wind_scale,
+                               gust_factor=args.gust_factor))
 
 
 def cmd_perimeter(args):
     _print_single(run_perimeter(args.fire, args.year, args.t0, args.t1, args.overlay,
-                                state=args.state, waf_scale=args.waf_scale, wind_scale=args.wind_scale))
+                                state=args.state, waf_scale=args.waf_scale, wind_scale=args.wind_scale,
+                                gust_factor=args.gust_factor, wind_source=args.wind_source))
 
 
 def cmd_batch(args):
@@ -350,12 +456,15 @@ def cmd_batch(args):
                 res = run_perimeter(run["fire"], run["year"], run["t0"], run["t1"],
                                     verbose=False, label=label, state=run.get("state"),
                                     waf_scale=run.get("waf_scale", args.waf_scale),
-                                    wind_scale=run.get("wind_scale", args.wind_scale))
+                                    wind_scale=run.get("wind_scale", args.wind_scale),
+                                    gust_factor=run.get("gust_factor", args.gust_factor),
+                                    wind_source=run.get("wind_source", args.wind_source))
             else:               # FIRMS footprint run
                 res = run_hindcast(run["bbox"], run["start"], run["t0"], run["t1"],
                                    run.get("sensor", default_sensor), verbose=False, label=label,
                                    waf_scale=run.get("waf_scale", args.waf_scale),
-                                   wind_scale=run.get("wind_scale", args.wind_scale))
+                                   wind_scale=run.get("wind_scale", args.wind_scale),
+                                   gust_factor=run.get("gust_factor", args.gust_factor))
             results.append(res)
             print(f"  ok   {label:<26} Jacc {res['jaccard']:.3f}  skill {res['skill']:+.3f}  bias {res['area_bias']:.2f}")
         except Exception as e:
@@ -376,16 +485,32 @@ def cmd_batch(args):
     print("-" * W)
 
     fair = [r for r in results if _is_fair(r)]
+
+    def _mean_row(label, subset):
+        n = len(subset)
+        if not n:
+            return
+        pos = sum(1 for r in subset if r["skill"] > 0.01)
+        print(f"{label:<45}"
+              f"{sum(r['grew_pct'] for r in subset)/n:>+7.0f}{sum(r['jaccard'] for r in subset)/n:>7.3f}"
+              f"{sum(r['base_jaccard'] for r in subset)/n:>7.3f}{sum(r['skill'] for r in subset)/n:>+8.3f}"
+              f"{sum(r['area_bias'] for r in subset)/n:>7.2f}   beats persistence {pos}/{n}")
+
     if fair:
-        nf = len(fair)
-        print(f"{'MEAN (fair tests, ' + str(nf) + ')':<45}"
-              f"{sum(r['grew_pct'] for r in fair)/nf:>+7.0f}{sum(r['jaccard'] for r in fair)/nf:>7.3f}"
-              f"{sum(r['base_jaccard'] for r in fair)/nf:>7.3f}{sum(r['skill'] for r in fair)/nf:>+8.3f}"
-              f"{sum(r['area_bias'] for r in fair)/nf:>7.2f}")
-        pos = sum(1 for r in fair if r["skill"] > 0.01)
+        # Split the fair set by fire behaviour. Persistence ("no change") is nearly
+        # unbeatable on days a fire barely moves, so the RUN-DAY subset — active
+        # growth, the days that matter for evacuation — is where skill is meaningful.
+        runs = [r for r in fair if r["grew_pct"] >= 100.0]
+        moderate = [r for r in fair if r["grew_pct"] < 100.0]
         print("=" * W)
-        print(f"{pos}/{nf} FAIR tests beat persistence.  ({len(results) - nf} unfair runs excluded "
-              f"from the mean.)  bias>1 over-predicts, <1 under-predicts.")
+        _mean_row(f"RUN DAYS (grew ≥100%, {len(runs)})", runs)
+        _mean_row(f"MODERATE DAYS (grew <100%, {len(moderate)})", moderate)
+        _mean_row(f"ALL FAIR ({len(fair)})", fair)
+        print("=" * W)
+        print(f"Skill = forecast Jaccard − persistence baseline; persistence is a STRONG "
+              f"baseline (fires keep their footprint). Read the RUN-DAYS row for real skill;\n"
+              f"moderate days are persistence-dominated by construction. bias>1 over-predicts, "
+              f"<1 under. ({len(results) - len(fair)} unfair runs — too small / quiet — excluded.)")
     else:
         print("=" * W)
         print("No fair tests (all too small or quiet days). Pick larger fires on active-growth days.")
@@ -412,6 +537,8 @@ def main():
                    help="multiply the wind adjustment factor (WAF experiment; needs backend rebuilt)")
     r.add_argument("--wind-scale", type=float, default=None,
                    help="multiply the wind series sent (spread/suppression calibration; no rebuild)")
+    r.add_argument("--gust-factor", type=float, default=0.5,
+                   help="blend gusts into the driving wind: eff = sustained + f*(gust-sustained), 0..1")
     r.set_defaults(func=cmd_run)
 
     pm = sub.add_parser("perimeter", help="hindcast a past fire vs REAL GeoMAC perimeters (2000-2019)")
@@ -424,6 +551,10 @@ def main():
     pm.add_argument("--waf-scale", type=float, default=None)
     pm.add_argument("--wind-scale", type=float, default=None,
                     help="multiply the wind series sent (spread calibration; no rebuild)")
+    pm.add_argument("--gust-factor", type=float, default=0.5,
+                    help="blend gusts into the driving wind: eff = sustained + f*(gust-sustained), 0..1")
+    pm.add_argument("--wind-source", choices=["era5", "hrrr"], default="era5",
+                    help="historical wind model: era5 (any year) or hrrr (~3km, 2021+, matches production)")
     pm.set_defaults(func=cmd_perimeter)
 
     b = sub.add_parser("batch", help="run many hindcasts from a JSON config and print a summary table")
@@ -433,6 +564,10 @@ def main():
                    help="multiply the WAF for all runs (per-run 'waf_scale' in config overrides)")
     b.add_argument("--wind-scale", type=float, default=None,
                    help="multiply the wind series for all runs (spread calibration; no rebuild)")
+    b.add_argument("--gust-factor", type=float, default=0.5,
+                   help="blend gusts into the driving wind for all runs (per-run 'gust_factor' overrides)")
+    b.add_argument("--wind-source", choices=["era5", "hrrr"], default="era5",
+                   help="historical wind model: era5 (any year) or hrrr (~3km, 2021+, matches production)")
     b.set_defaults(func=cmd_batch)
 
     args = p.parse_args()

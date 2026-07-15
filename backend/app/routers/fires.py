@@ -47,6 +47,21 @@ async def perimeters_bbox(
         raise HTTPException(status_code=502, detail=f"Perimeter data source error: {exc}")
 
 
+@router.get("/perimeters/at")
+async def perimeter_at(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+):
+    """Whether the fire at this point has an official mapped perimeter (so its spread
+    can be forecast). Mirrors the /predict no-perimeter guard so the UI's forecast
+    button agrees with what a forecast would actually do."""
+    try:
+        has = await fires_svc.has_perimeter_near(lat, lon)
+    except Exception:
+        has = False
+    return {"has_perimeter": has}
+
+
 @router.get("/hotspots/bbox")
 async def hotspots_bbox(
     west: float = Query(..., ge=-180, le=180),

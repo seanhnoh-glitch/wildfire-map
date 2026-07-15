@@ -37,6 +37,7 @@
   .btn[disabled] { opacity:.6; }
   .fc { margin-top:14px; }
   .fc .lab { font-size:12px; color:#666; }
+  #fcInfo.minimal { color:#b5321f; font-weight:600; }
   .fc input[type=range] { width:100%; margin-top:10px; accent-color:var(--fire); }
   .hourrow { display:flex; justify-content:space-between; align-items:center; margin-top:6px; }
   .hourrow b { font-size:20px; } .disc { font-size:11px; color:#999; margin-top:10px; }
@@ -64,6 +65,16 @@
     box-shadow:0 4px 14px rgba(0,0,0,.28); }
   .evacfab:active { background:#1a6640; }
   .evacfab:disabled { background:#8a8f8b; opacity:.85; box-shadow:0 2px 8px rgba(0,0,0,.18); }
+  /* Base-map switcher — a vertical pill of two icon buttons; the active base map
+     is filled blue. Sits under the search bar, clear of the (transient) toast. */
+  .basemap { position:absolute; top:calc(env(safe-area-inset-top) + 110px); right:10px; z-index:5;
+    display:flex; flex-direction:column; gap:8px; padding:8px; background:#fff;
+    border-radius:28px; box-shadow:0 2px 12px rgba(0,0,0,.22); }
+  .basemap .bm { width:44px; height:44px; padding:0; border:0; border-radius:50%; background:transparent;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; }
+  .basemap .bm svg { width:24px; height:24px; fill:#5f6368; }
+  .basemap .bm.active { background:#1a73e8; }
+  .basemap .bm.active svg { fill:#fff; }
 </style>
 </head>
 <body>
@@ -81,9 +92,21 @@
      nearest such fire — no need to pick a fire first. Hidden while a sheet is open. -->
 <button id="evacFab" class="evacfab" style="display:none">Plan evacuation route</button>
 
+<!-- Base-map switcher: two icon buttons (navigation map / satellite imagery). The
+     active base map is filled blue. Standard is the default. -->
+<div id="basemapSwitch" class="basemap">
+  <button class="bm active" data-kind="standard" title="Navigation map" aria-label="Navigation map">
+    <svg viewBox="0 0 24 24"><path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/></svg>
+  </button>
+  <button class="bm" data-kind="satellite" title="Satellite imagery" aria-label="Satellite imagery">
+    <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+  </button>
+</div>
+
 <div class="legend" id="legend">
   <div><i style="background:#ffd88f"></i>+1h &nbsp; <i style="background:#f5a24a"></i>+12h &nbsp; <i style="background:#ec7048"></i>+24h</div>
-  <div style="margin-top:4px"><i style="background:#b5321f;opacity:.35"></i>current fire footprint</div>
+  <div style="margin-top:4px"><i style="background:#ff4326;opacity:.5"></i>current fire footprint</div>
+  <div id="legStart" style="margin-top:4px;display:none"><i style="border-top:2px dashed #5c2310;background:none;border-radius:0;height:0;width:14px;vertical-align:2px"></i>starting perimeter (minimal spread)</div>
   <div style="margin-top:4px">
     <i style="background:#ffe66a;margin-right:1px"></i><i style="background:#ffb020;margin-right:1px"></i><i style="background:#ff7a00;margin-right:1px"></i><i style="background:#f23018;margin-right:1px"></i><i style="background:#a10000"></i>
     fire intensity (low → extreme, zoom in)
@@ -101,7 +124,7 @@
     <div class="lab" id="fcInfo"></div>
     <div class="hourrow"><span class="lab">Forecast horizon</span><b id="hourLabel">+24h</b></div>
     <input id="hour" type="range" min="1" max="24" step="1" value="24">
-    <div class="disc">Research estimate — wind-, fuel-, and terrain-driven ForeFire simulation. Not operational guidance.</div>
+    <div class="disc">Research estimate — wind-, fuel-, and terrain-driven ForeFire simulation. It assumes free spread and does not model control lines, so it's a worst case. Not operational guidance.</div>
   </div>
   <button class="btn evac" id="evacBtn" style="display:none">Plan evacuation route</button>
 </div>
@@ -119,26 +142,38 @@
 // Served from the backend, so the API is same-origin — no config, no CORS.
 const API = window.location.origin;
 
-// Keyless satellite imagery base map (dev/prototype use) so actual vegetation —
-// forest canopy vs. dry grass/scrub vs. bare ground — is directly visible, with a
-// transparent reference overlay for roads and place names.
-const STYLE = {
-  version: 8,
-  sources: {
-    imagery: { type:"raster", tileSize:256,
-      tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
-      attribution:"Imagery © Esri, Maxar, Earthstar Geographics" },
-    labels: { type:"raster", tileSize:256,
-      tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"],
-      attribution:"© Esri" }
+// Two keyless base maps the user can switch between (see the basemap toggle):
+//  • standard  — plain OSM navigation map (the default; roads/places, easy to read)
+//  • satellite — Esri imagery so actual vegetation (forest canopy vs. dry grass/
+//    scrub vs. bare ground) is directly visible, with a transparent roads/places
+//    reference overlay on top.
+const BASEMAPS = {
+  standard: {
+    version: 8,
+    sources: { osm: { type:"raster", tileSize:256,
+      tiles:["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+      attribution:"© OpenStreetMap" } },
+    layers: [{ id:"osm", type:"raster", source:"osm" }]
   },
-  layers: [
-    { id:"imagery", type:"raster", source:"imagery" },
-    { id:"labels", type:"raster", source:"labels" }
-  ]
+  satellite: {
+    version: 8,
+    sources: {
+      imagery: { type:"raster", tileSize:256,
+        tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        attribution:"Imagery © Esri, Maxar, Earthstar Geographics" },
+      labels: { type:"raster", tileSize:256,
+        tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"],
+        attribution:"© Esri" }
+    },
+    layers: [
+      { id:"imagery", type:"raster", source:"imagery" },
+      { id:"labels", type:"raster", source:"labels" }
+    ]
+  }
 };
+let basemap = "standard";   // default to the plain navigation map
 
-const map = new maplibregl.Map({ container:"map", style:STYLE, center:[-119.4,37.5], zoom:5.2 });
+const map = new maplibregl.Map({ container:"map", style:BASEMAPS[basemap], center:[-96.5,38.5], zoom:3.4 });
 map.addControl(new maplibregl.NavigationControl({ showCompass:false }), "bottom-right");
 
 // How many hours ahead to forecast (schema allows up to 48; the hourly wind
@@ -147,6 +182,7 @@ const FORECAST_HOURS = 24;
 
 let fires = [], selected = null, prediction = null, origin = null, animTimer = null;
 let watchId = null, routeOrigin = null, rerouting = false;   // live-location tracking state
+let lastEvac = null;   // last evacuation result, kept so a base-map swap can redraw the routes
 let originMode = null;   // 'search' (typed address, pinned) | 'gps' (follows live location)
 function haversineKm(la1, lo1, la2, lo2){ const R=6371, r=Math.PI/180;
   const dLa=(la2-la1)*r, dLo=(lo2-lo1)*r;
@@ -171,9 +207,20 @@ function setSource(id, data, layers){
 // the point of origin and can sit at the edge of / outside the perimeter). We
 // match incidents to perimeters by name and use the area-centroid of the largest
 // ring. Fires without a mapped perimeter keep their incident point.
-let perimCenter = {};   // normalized incident name -> [lon,lat]
-let perimBounds = {};   // normalized incident name -> [[minLon,minLat],[maxLon,maxLat]]
+// normalized name -> LIST of {center:[lon,lat], bounds:[[minLon,minLat],[maxLon,maxLat]]}.
+// A list, not one entry, because fire names collide ("Cottonwood" exists in several
+// states); keying by name alone would yank a flame to the wrong state's perimeter.
+let perimByName = {};
 function normName(s){ return (s||"").trim().toUpperCase().replace(/\s+/g," "); }
+// The perimeter of matching name NEAREST a fire's point — its own, not a namesake's.
+function perimForFire(f){
+  const cands = perimByName[normName(f.name)];
+  if(!cands || !cands.length) return null;
+  let best=cands[0], bd=Infinity;
+  for(const c of cands){ const dx=c.center[0]-f.lon, dy=c.center[1]-f.lat, d=dx*dx+dy*dy;
+    if(d<bd){ bd=d; best=c; } }
+  return best;
+}
 function ringBounds(r){
   let m=[Infinity,Infinity], M=[-Infinity,-Infinity];
   r.forEach(([x,y])=>{ if(x<m[0])m[0]=x; if(y<m[1])m[1]=y; if(x>M[0])M[0]=x; if(y>M[1])M[1]=y; });
@@ -208,27 +255,50 @@ function ringCentroid(r){   // area centroid via the shoelace formula
   return [cx/(6*a), cy/(6*a)];
 }
 function buildPerimCenters(fc){
-  perimCenter = {}; perimBounds = {};
+  perimByName = {};
   (fc && fc.features || []).forEach(f=>{
     const nm = normName(f.properties && f.properties.poly_IncidentName);
     if(!nm) return;
     const ring = largestRing(f.geometry);
-    if(ring && ring.length>=4){ perimCenter[nm] = ringCentroid(ring); perimBounds[nm] = ringBounds(ring); }
+    if(ring && ring.length>=4){
+      (perimByName[nm] = perimByName[nm] || []).push({ center: ringCentroid(ring), bounds: ringBounds(ring) });
+    }
   });
 }
 function applyPerimCenters(){   // move matched fires to their perimeter center, then redraw
   let moved=0;
-  fires.forEach(f=>{ const c=perimCenter[normName(f.name)]; if(c){ f.lon=c[0]; f.lat=c[1]; moved++; } });
+  fires.forEach(f=>{ const c=perimForFire(f); if(c){ f.lon=c.center[0]; f.lat=c.center[1]; moved++; } });
   drawFirePoints();
   return moved;
 }
 
+// A crisp two-tone flame icon marking each fire's location. Drawn on a canvas from
+// SVG paths (so it's built synchronously — no image-load race) with a white edge so
+// it stands out on either base map. setStyle drops map images, so ensureFireImage
+// re-adds it whenever we (re)draw the fire markers.
+function makeFireIcon(){
+  const s = 2, W = 40*s, H = 48*s;                        // render at 2x for a sharp icon
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const ctx = c.getContext("2d"); ctx.scale(s, s); ctx.lineJoin = "round";
+  const outer = new Path2D("M20 3 C 26 12 32 16 31 27 C 30.5 38 25 45 20 45 C 15 45 9.5 38 9 27 C 8 16 14 12 20 3 Z");
+  ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2.5; ctx.stroke(outer);   // white halo → pops on any background
+  ctx.fillStyle = "#ef3b1e"; ctx.fill(outer);
+  const inner = new Path2D("M20 16 C 23 21 25 24 24.5 29 C 24 34 22 38 20 38 C 18 38 16 34 15.5 29 C 15 24 17 21 20 16 Z");
+  ctx.fillStyle = "#ffcf3f"; ctx.fill(inner);
+  return ctx.getImageData(0, 0, W, H);
+}
+function ensureFireImage(){
+  if(!map.hasImage("fire")) map.addImage("fire", makeFireIcon(), { pixelRatio: 2 });
+}
+
 function drawFirePoints(){
+  ensureFireImage();
   const pts = { type:"FeatureCollection", features: fires.map(f => ({
     type:"Feature", properties:{ id:f.id, name:f.name }, geometry:{ type:"Point", coordinates:[f.lon,f.lat] } })) };
   setSource("fires", pts, [
-    { id:"fires-dot", type:"circle", source:"fires",
-      paint:{ "circle-radius":6,"circle-color":"#d85a30","circle-stroke-color":"#fff","circle-stroke-width":1.5 } },
+    { id:"fires-dot", type:"symbol", source:"fires",
+      layout:{ "icon-image":"fire", "icon-anchor":"bottom", "icon-allow-overlap":true,
+        "icon-size":["interpolate",["linear"],["zoom"], 4,0.42, 8,0.6, 12,0.72] } },
   ]);
 }
 
@@ -251,16 +321,21 @@ const PERIM_ZOOM = 7.5;   // at/above this zoom, fetch crisp viewport perimeters
 
 function setPerimeters(fc){
   setSource("perimeters", fc || {type:"FeatureCollection",features:[]}, [
-    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.25 } },
-    { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#8f2417","line-width":1.5 } },
+    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#ff4326","fill-opacity":0.22 } },
+    // White casing under a bright red line so the perimeter reads clearly on satellite
+    // imagery — over both dark-green canopy and light tan/brown ground.
+    { id:"perim-line-casing", type:"line", source:"perimeters",
+      paint:{ "line-color":"#ffffff","line-width":4,"line-opacity":0.55 } },
+    { id:"perim-line", type:"line", source:"perimeters",
+      paint:{ "line-color":"#ff2d00","line-width":2,"line-opacity":1 } },
   ]);
-  if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
+  if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep fire markers on top
 }
 
 // Draw ALL current fire perimeters nationwide up front (no click needed).
 async function loadAllPerimeters(){
   try {
-    nationalPerims = await jget("/perimeters/all?min_acres=100");
+    nationalPerims = await jget("/perimeters/all?min_acres=10");
     setPerimeters(nationalPerims);
     buildPerimCenters(nationalPerims);
     if(fires.length) applyPerimCenters();   // reposition dots now that centers are known
@@ -268,6 +343,9 @@ async function loadAllPerimeters(){
 }
 
 // On pan/zoom: crisp viewport perimeters when zoomed in, national base when out.
+// A monotonic token guards against out-of-order responses: moveend and the 5-min
+// auto-refresh can overlap, and a slow earlier fetch must not clobber a newer one.
+let perimReqSeq = 0;
 async function refreshPerimeters(){
   if (map.getZoom() < PERIM_ZOOM){
     if (nationalPerims && map.getSource("perimeters")) map.getSource("perimeters").setData(nationalPerims);
@@ -277,9 +355,18 @@ async function refreshPerimeters(){
   const w=b.getWest(), s=b.getSouth(), e=b.getEast(), n=b.getNorth();
   // Simplify by ~1 pixel so detail matches the screen while payloads stay small.
   const offset = Math.max(0, (e - w) / Math.max(1, map.getCanvas().clientWidth) * 1.2);
+  const seq = ++perimReqSeq;
   try {
     const fc = await jget(`/perimeters/bbox?west=${w}&south=${s}&east=${e}&north=${n}&min_acres=10&offset=${offset}`);
-    if (map.getSource("perimeters")) map.getSource("perimeters").setData(fc);
+    if (seq !== perimReqSeq) return;                    // a newer request already answered — ignore stale data
+    if (!map.getSource("perimeters")) return;
+    // Never wipe the overlay with an empty result (server hiccup / over-simplified):
+    // keep the national base visible instead of showing a blank map.
+    if (!fc || !(fc.features||[]).length){
+      if (nationalPerims) map.getSource("perimeters").setData(nationalPerims);
+      return;
+    }
+    map.getSource("perimeters").setData(fc);
     if (map.getLayer("fires-dot")) map.moveLayer("fires-dot");
   } catch(err){ /* keep whatever is currently shown */ }
 }
@@ -422,7 +509,7 @@ function refreshEvac(){ updateEvacBtn(); updateEvacFab(); }
 function openSheet(f){
   selected = f; prediction = null;
   clearInterval(animTimer); animTimer = null;
-  ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
+  ["iso-fill","iso-line","isostart-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
   document.getElementById("legend").classList.remove("show");
   document.getElementById("fName").textContent = f.name;
   const parts = [];
@@ -432,16 +519,29 @@ function openSheet(f){
   document.getElementById("fMeta").textContent = parts.join(" · ");
   document.getElementById("fSub").textContent = [f.county, f.state].filter(Boolean).join(", ");
   document.getElementById("fc").style.display = "none";
-  // A 100%-contained fire has a complete control line and won't spread outward,
-  // so a free-spread forecast is meaningless — disable it.
+  // Disable the forecast when it can't be run: a 100%-contained fire has a complete
+  // control line and won't spread, and a fire with no mapped perimeter has no
+  // footprint to ignite from (the backend declines these too — see predict()).
   const btn = document.getElementById("predictBtn");
   btn.style.display = "block";
   if (f.percent_contained != null && f.percent_contained >= 100){
     btn.disabled = true;
     btn.textContent = "🛡️ 100% contained — no spread expected";
   } else {
+    // Ask the backend the SAME question the forecast guard asks, so the button can
+    // never disagree with what /predict does (the map draws perimeters from a
+    // different source than any client-side name match, so that was unreliable).
+    // Optimistic while it loads; only disables if the backend confirms no perimeter.
     btn.disabled = false;
     btn.textContent = "Forecast spread →";
+    const who = f.id;
+    jget(`/perimeters/at?lat=${f.lat}&lon=${f.lon}`).then(r=>{
+      if(!selected || selected.id !== who) return;   // user opened a different fire meanwhile
+      if(!r.has_perimeter){
+        btn.disabled = true;
+        btn.textContent = "No mapped perimeter — can't forecast";
+      }
+    }).catch(()=>{});   // on error leave it enabled — the backend still guards on click
   }
   // Evacuation is offered only when we know your location and this fire is close
   // enough to matter (see updateEvacBtn). Once a forecast is run it upgrades to
@@ -453,19 +553,53 @@ function openSheet(f){
   // Zoom to FIT the fire, not a fixed level: real perimeter bounds if we have
   // them, else a box from the acreage. Expanded ~1.8x so the forecast has room to
   // spread beyond the current perimeter without running off-screen.
-  const pb = perimBounds[normName(f.name)];
-  let box = pb || (f.size_acres != null ? boundsForAcres(f.lon, f.lat, f.size_acres) : null);
+  const match = perimForFire(f);
+  let box = (match && match.bounds) || (f.size_acres != null ? boundsForAcres(f.lon, f.lat, f.size_acres) : null);
   if (box) map.fitBounds(expandBounds(box, 1.8), { padding: 50, maxZoom: 12, duration: 800 });
   else map.flyTo({ center:[f.lon,f.lat], zoom:10 });
 }
 function closeSheet(){ hideSheet(sheet); selected=null;
   clearInterval(animTimer); animTimer=null;
   document.getElementById("legend").classList.remove("show");
-  ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
+  ["iso-fill","iso-line","isostart-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
   updateEvacFab();          // bottom is free again — show the floating button if a location is set
 }
 
 document.getElementById("closeSheet").onclick = closeSheet;
+
+// Draw a prediction's isochrones (fill + outline) and return its horizon in hours.
+// Shared by runForecast and the base-map restore path (see restoreOverlays).
+function drawIso(pred){
+  const feats = pred.isochrones.features;
+  const maxH = Math.max(...feats.map(f=>f.properties.hours));
+  // Time gradient: light (soon) → deep red (full horizon). Stops must ascend,
+  // so drop the mid stop when the horizon is tiny (partial forecast).
+  const fillColor = maxH >= 3
+    ? ["interpolate",["linear"],["get","hours"], 1,"#ffd88f", maxH/2,"#f5a24a", maxH,"#ec7048"]
+    : ["interpolate",["linear"],["get","hours"], 1,"#ffd88f", Math.max(1.5,maxH),"#ec7048"];
+  setSource("iso", pred.isochrones, [
+    { id:"iso-fill", type:"fill", source:"iso", paint:{
+        "fill-color":fillColor, "fill-opacity":0.18 } },
+    { id:"iso-line", type:"line", source:"iso", paint:{ "line-color":"#e8613a","line-width":1,"line-opacity":0.5 } },
+  ]);
+  // Starting-footprint reference (dashed outline of the earliest isochrone). Shown
+  // ONLY when the fire is predicted to barely move — that's the case where "no
+  // change" isn't otherwise obvious. When the fire clearly grows it's hidden, since
+  // the orange spreading past the perimeter already shows the growth.
+  const first = feats.reduce((a,b)=> b.properties.hours < a.properties.hours ? b : a, feats[0]);
+  const aFirst = first.properties.area_km2 || 0;
+  const aLast = feats.reduce((a,b)=> b.properties.hours > a.properties.hours ? b : a, feats[0]).properties.area_km2 || aFirst;
+  const minimal = !!(pred.isochrones.properties||{}).low_spread || (aFirst > 0 && (aLast/aFirst - 1)*100 < 8);
+  setSource("isostart", { type:"FeatureCollection", features:[first] }, [
+    { id:"isostart-line", type:"line", source:"isostart",
+      paint:{ "line-color":"#5c2310","line-width":1.6,"line-dasharray":[2,1.6],"line-opacity":0.95 } },
+  ]);
+  if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");   // keep fire dots above the fill
+  ["iso-fill","iso-line"].forEach(id=> map.getLayer(id) && map.setLayoutProperty(id,"visibility","visible"));
+  if(map.getLayer("isostart-line")) map.setLayoutProperty("isostart-line","visibility", minimal ? "visible" : "none");
+  const legStart = document.getElementById("legStart"); if(legStart) legStart.style.display = minimal ? "block" : "none";
+  return maxH;
+}
 
 async function runForecast(){
   if(!selected) return;
@@ -473,33 +607,37 @@ async function runForecast(){
   try {
     prediction = await jpost("/predict", { lat:selected.lat, lon:selected.lon, duration_hours:FORECAST_HOURS, step_minutes:60,
       percent_contained:selected.percent_contained });
-    // Fully-contained fires return no forecast (empty isochrones) with a note.
-    if (prediction.contained || !(prediction.isochrones.features||[]).length){
+    // No forecast produced: fully contained, no mapped perimeter, or empty result.
+    if (prediction.contained || prediction.no_perimeter || !(prediction.isochrones.features||[]).length){
       document.getElementById("fcInfo").textContent = (prediction.notes && prediction.notes[0])
-        || "No spread forecast: this fire is reported fully contained.";
+        || "No spread forecast available for this fire.";
       document.getElementById("fc").style.display = "block";
-      btn.disabled = true; btn.textContent = "🛡️ No spread expected";
+      btn.disabled = true;
+      btn.textContent = prediction.no_perimeter ? "No mapped perimeter — can't forecast"
+                                                : "🛡️ No spread expected";
       return;
     }
-    const feats = prediction.isochrones.features;
-    const maxH = Math.max(...feats.map(f=>f.properties.hours));
-    // Time gradient: light (soon) → deep red (full horizon). Stops must ascend,
-    // so drop the mid stop when the horizon is tiny (partial forecast).
-    const fillColor = maxH >= 3
-      ? ["interpolate",["linear"],["get","hours"], 1,"#ffd88f", maxH/2,"#f5a24a", maxH,"#ec7048"]
-      : ["interpolate",["linear"],["get","hours"], 1,"#ffd88f", Math.max(1.5,maxH),"#ec7048"];
-    setSource("iso", prediction.isochrones, [
-      { id:"iso-fill", type:"fill", source:"iso", paint:{
-          "fill-color":fillColor, "fill-opacity":0.18 } },
-      { id:"iso-line", type:"line", source:"iso", paint:{ "line-color":"#e8613a","line-width":1,"line-opacity":0.5 } },
-    ]);
-    // Keep fire dots above the fill.
-    if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
-    ["iso-fill","iso-line"].forEach(id=> map.setLayoutProperty(id,"visibility","visible"));
+    const maxH = drawIso(prediction);
     const p = prediction.parameters;
-    document.getElementById("fcInfo").textContent =
-      `engine: ${prediction.engine} · ignition: ${p.ignition} · fuel ${p.fuel_model} · ` +
-      `wind ${Math.round(p.wind_speed_kmh)}→${Math.round(p.wind_end_speed_kmh)} km/h`;
+    // Plain-language spread magnitude so the user can tell growth from "barely moves".
+    // Baseline is the fire's CURRENT reported size (matching the header), not the
+    // first isochrone, so the numbers read consistently (e.g. "667 → 900 acres").
+    const feats = prediction.isochrones.features;
+    const props = prediction.isochrones.properties || {};
+    const ACRE = 0.00404686;
+    const aN = feats.reduce((a,b)=> b.properties.hours > a.properties.hours ? b : a, feats[0]).properties.area_km2 || 0;
+    const a0km = feats.reduce((a,b)=> b.properties.hours < a.properties.hours ? b : a, feats[0]).properties.area_km2 || 0;
+    const cur = (selected.size_acres || a0km/ACRE);   // current fire size (acres)
+    const endAcres = aN/ACRE;
+    const growthPct = cur > 0 ? (endAcres/cur - 1)*100 : 0;
+    const minimal = !!props.low_spread || growthPct < 8;
+    const growthTxt = growthPct < 1 ? "<1%" : "+"+Math.round(growthPct)+"%";
+    const spread = minimal
+      ? `⚠︎ Minimal spread predicted — the perimeter barely changes (${growthTxt} over ${maxH}h).`
+      : `Predicted growth ${growthTxt} over ${maxH}h (${Math.round(cur).toLocaleString()} → ${Math.round(endAcres).toLocaleString()} acres).`;
+    const fcInfo = document.getElementById("fcInfo");
+    fcInfo.textContent = `${spread} · fuel ${p.fuel_model} · wind ${Math.round(p.wind_speed_kmh)}→${Math.round(p.wind_end_speed_kmh)} km/h`;
+    fcInfo.classList.toggle("minimal", minimal);
     const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
     document.getElementById("fc").style.display = "block";
     document.getElementById("predictBtn").style.display = "none";
@@ -581,6 +719,7 @@ function openEvacSheet(fire){
 function closeEvacSheet(){
   hideSheet(evacSheet);
   clearEvac();
+  lastEvac = null;
   updateEvacFab();          // bottom is free again — show the floating button if a location is set
 }
 
@@ -604,6 +743,7 @@ async function planEvacuation(opts){
     if(target===selected && prediction && prediction.isochrones) body.avoid_geojson=prediction.isochrones;
     const res = await jpost("/evacuation", body);
     routeOrigin = { lat:origin.lat, lon:origin.lon };               // where these routes start from
+    lastEvac = res;                                                 // remember for a base-map redraw
     if(!opts.auto){ openEvacSheet(target); hideToast(); }
     renderRoutes(res, { refit: !opts.auto });                       // don't yank the view on auto re-plan
   }catch(e){ if(!opts.auto) toast("Evacuation planning failed: "+e.message); }
@@ -695,6 +835,36 @@ document.querySelectorAll(".sheet .grip").forEach(g=>{
 // Dragging the slider takes over from the animation.
 document.getElementById("hour").oninput = (e)=>{ clearInterval(animTimer); animTimer=null; applyHour(Number(e.target.value)); };
 document.getElementById("addr").addEventListener("keydown", e=>{ if(e.key==="Enter") search(); });
+
+// --- Base-map switcher -------------------------------------------------------
+// Swapping styles (map.setStyle) drops every custom source/layer, so re-add all
+// of our overlays from current state once the new base map has loaded.
+function restoreOverlays(){
+  if(nationalPerims) setPerimeters(nationalPerims);
+  drawFirePoints();
+  refreshPerimeters();      // crisp viewport perimeters if we're zoomed in
+  refreshHotspots();
+  // A forecast currently on screen: redraw its isochrones and resume where it was.
+  const isoShown = prediction && prediction.isochrones
+                   && (prediction.isochrones.features||[]).length && sheet.classList.contains("show");
+  if(isoShown){
+    const maxH = drawIso(prediction);
+    if(animTimer) animateForecast(maxH);                               // was animating → keep sweeping
+    else applyHour(Number(document.getElementById("hour").value));     // was paused → hold the same hour
+  }
+  // Evacuation routes currently on screen: redraw them (don't refit the view).
+  if(lastEvac && evacSheet.classList.contains("show")) renderRoutes(lastEvac, { refit:false });
+}
+function setBasemap(kind){
+  if(kind===basemap) return;
+  basemap = kind;
+  map.setStyle(BASEMAPS[kind]);
+  map.once("styledata", restoreOverlays);   // fires once the new style is ready for our layers
+  document.querySelectorAll("#basemapSwitch .bm").forEach(b=>
+    b.classList.toggle("active", b.dataset.kind===kind));
+}
+document.querySelectorAll("#basemapSwitch .bm").forEach(b=>
+  b.onclick = ()=> setBasemap(b.dataset.kind));
 
 // Show all ongoing fires + all perimeters as soon as the map is ready.
 map.on("load", ()=>{ loadAllPerimeters(); loadAllFires(); });

@@ -499,6 +499,10 @@ async def plan(
     dests = _filter_and_rank_destinations(candidates, lat, lon, fire_lonlat, danger, away_bearing)
     if not any(d["category"] == "shelter" for d in dests):
         notes.append("No open shelters listed near you — routing to the safest nearby town/facility instead.")
+    # We only see FEMA "open shelters"; the county-run evacuation centre for THIS fire
+    # is announced per-incident and won't appear here. Always point to the real source.
+    notes.append("Confirm the official evacuation centre and current order via Watch Duty "
+                 "or your county emergency management — it may differ from the destinations shown.")
 
     # 3. Driving routes to each destination, then drop any that cross the fire.
     #    Prefer Mapbox (live traffic) when a token exists; otherwise fall back to

@@ -7,3 +7,13 @@ venv/
 .pytest_cache/
 validation/snapshots/
 validation/*_overlay.geojson
+# Reproducible-validation disk cache (static fuel/DEM/slope fetches)
+.fetch_cache/
+# Harvested ML dataset (regenerate with validation/harvest.py)
+validation/batch_harvested.json
+# ML feature/residual tables + geometry (regenerate with validation/build_features.py)
+validation/features*.csv
+validation/features*.jsonl
+# Trained ML correction model (regenerate with validation/train_correction.py)
+app/ml/*.joblib
+app/ml/*_meta.json

@@ -14,11 +14,13 @@ LANDFIRE FBFM40 ImageServer (LANDFIRE 2022 / LF2.3.0, CONUS):
   Public, no key. The `identify` op returns the raster pixel value — the integer
   FBFM40 code (e.g. 102 = GR2) — which we map back to a Scott & Burgan code.
 """
+import asyncio
 import json
 from typing import Optional
 
 import httpx
 
+from . import geocache
 from .fuel_table import BARRIER_FUEL_INDEX
 
 # LANDFIRE 2022 Scott & Burgan 40 fire behavior fuel model image service.
@@ -141,6 +143,11 @@ async def fuel_grid(
     Returns {"values": [[int]] (row 0 = south, col 0 = west), "ncols", "nrows",
     "nonburn_pct"} or None on failure (caller falls back to a uniform fuel map).
     """
+    ckey = f"{west:.4f},{south:.4f},{east:.4f},{north:.4f},{sample_count}"
+    cached = geocache.get("fuelgrid", ckey)
+    if cached is not None:
+        return cached
+
     geom = {"xmin": west, "ymin": south, "xmax": east, "ymax": north,
             "spatialReference": {"wkid": 4326}}
     params = {
@@ -150,13 +157,22 @@ async def fuel_grid(
         "returnFirstValueOnly": "true",
         "f": "json",
     }
-    try:
-        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
-            resp = await client.get(LANDFIRE_FBFM40_GETSAMPLES, params=params)
-            resp.raise_for_status()
-            samples = resp.json().get("samples", [])
-    except Exception:
-        return None
+    # Retry a few times: a transient LANDFIRE timeout would otherwise silently drop
+    # the fuel grid and fall back to a UNIFORM fuel map (no water/urban barriers,
+    # and non-deterministic run-to-run). One reliable real grid matters more here.
+    samples = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+                resp = await client.get(LANDFIRE_FBFM40_GETSAMPLES, params=params)
+                resp.raise_for_status()
+                samples = resp.json().get("samples", [])
+            if samples:
+                break
+        except Exception:
+            samples = None
+        if attempt < 2:
+            await asyncio.sleep(0.6 * (attempt + 1))
     if not samples:
         return None
 
@@ -180,9 +196,11 @@ async def fuel_grid(
         grid[yi[y]][xi[x]] = code
         if code == BARRIER_FUEL_INDEX:
             nonburn += 1
-    return {
+    result = {
         "values": grid,
         "ncols": ncols,
         "nrows": nrows,
         "nonburn_pct": 100.0 * nonburn / max(1, len(pts)),
     }
+    geocache.put("fuelgrid", ckey, result)
+    return result
