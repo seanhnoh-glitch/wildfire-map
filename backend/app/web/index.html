@@ -269,6 +269,10 @@ function applyPerimCenters(){   // move matched fires to their perimeter center,
   let moved=0;
   fires.forEach(f=>{ const c=perimForFire(f); if(c){ f.lon=c.center[0]; f.lat=c.center[1]; moved++; } });
   drawFirePoints();
+  // A fire whose sheet is already open may only now have gained a perimeter (and had
+  // its dot moved onto it), so re-evaluate its forecast button — this is what unblocks
+  // the "drawn perimeter but says can't forecast" case without needing a second click.
+  if(selected) refreshForecastAvailability(selected);
   return moved;
 }
 
@@ -506,6 +510,41 @@ function updateEvacFab(){
   fab.textContent = near ? "Plan evacuation route" : `No fire within ${THREAT_ALERT_KM} km`;
 }
 function refreshEvac(){ updateEvacBtn(); updateEvacFab(); }
+// Whether the selected fire's forecast button can run, re-evaluated on demand.
+// The answer depends on the fire's MAPPED PERIMETER, and a fire's dot only moves
+// onto that perimeter once perimeters finish loading (applyPerimCenters). So a single
+// check at click time can run too early — before the dot is reconciled or the backend
+// snapshot is warm — and wrongly say "no perimeter" even while the polygon is drawn on
+// the map. We therefore:
+//   • re-run this whenever perimeters (re)load, so a late perimeter unblocks the button;
+//   • never let a stale "no" stick — each call re-enables optimistically first;
+//   • keep it enabled if the client already matched a perimeter for this fire — that
+//     match IS the polygon drawn on the map, so it definitely exists. The backend
+//     /predict guard is the real safety net, so a false-enable just yields the same
+//     decline on submit.
+function refreshForecastAvailability(f){
+  const btn = document.getElementById("predictBtn");
+  if(!btn || !selected || selected.id !== f.id) return;
+  if(btn.style.display === "none") return;          // a forecast is already shown — leave it
+  if(f.percent_contained != null && f.percent_contained >= 100){
+    btn.disabled = true;
+    btn.textContent = "🛡️ 100% contained — no spread expected";
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = "Forecast spread →";
+  const who = f.id;
+  jget(`/perimeters/at?lat=${f.lat}&lon=${f.lon}`).then(r=>{
+    if(!selected || selected.id !== who) return;    // user opened a different fire meanwhile
+    // Only disable when the backend says no AND we have no client-side perimeter match.
+    // If perimeters are still loading, a later applyPerimCenters() re-runs this with the
+    // dot moved onto the polygon, and the answer flips to yes.
+    if(!r.has_perimeter && !perimForFire(f)){
+      btn.disabled = true;
+      btn.textContent = "No mapped perimeter — can't forecast";
+    }
+  }).catch(()=>{});   // on error leave it enabled — the backend still guards on click
+}
 function openSheet(f){
   selected = f; prediction = null;
   clearInterval(animTimer); animTimer = null;
@@ -524,25 +563,10 @@ function openSheet(f){
   // footprint to ignite from (the backend declines these too — see predict()).
   const btn = document.getElementById("predictBtn");
   btn.style.display = "block";
-  if (f.percent_contained != null && f.percent_contained >= 100){
-    btn.disabled = true;
-    btn.textContent = "🛡️ 100% contained — no spread expected";
-  } else {
-    // Ask the backend the SAME question the forecast guard asks, so the button can
-    // never disagree with what /predict does (the map draws perimeters from a
-    // different source than any client-side name match, so that was unreliable).
-    // Optimistic while it loads; only disables if the backend confirms no perimeter.
-    btn.disabled = false;
-    btn.textContent = "Forecast spread →";
-    const who = f.id;
-    jget(`/perimeters/at?lat=${f.lat}&lon=${f.lon}`).then(r=>{
-      if(!selected || selected.id !== who) return;   // user opened a different fire meanwhile
-      if(!r.has_perimeter){
-        btn.disabled = true;
-        btn.textContent = "No mapped perimeter — can't forecast";
-      }
-    }).catch(()=>{});   // on error leave it enabled — the backend still guards on click
-  }
+  // Decide (and label) whether the forecast can run. Runs here AND again whenever
+  // perimeters (re)load — see refreshForecastAvailability for why one check at click
+  // time isn't enough (the reported "drawn perimeter but can't forecast" bug).
+  refreshForecastAvailability(f);
   // Evacuation is offered only when we know your location and this fire is close
   // enough to matter (see updateEvacBtn). Once a forecast is run it upgrades to
   // routing around the PREDICTED spread (see runForecast, which passes it to avoid).
