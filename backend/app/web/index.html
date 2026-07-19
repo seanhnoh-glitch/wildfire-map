@@ -31,6 +31,21 @@
   .grip::before { content:""; position:absolute; inset:-14px -60px; }   /* enlarge tap target */
   .sheet h2 { margin:0 0 4px; font-size:18px; }
   .meta { color:#333; font-size:14px; } .sub { color:#888; font-size:12px; margin-top:2px; }
+  .fireinfo { margin-top:10px; padding:12px 14px; background:#f7f7f5; border-radius:12px; }
+  .fireinfo .row { display:flex; justify-content:space-between; align-items:flex-start; gap:12px;
+    padding:6px 0; font-size:13px; line-height:1.35; }
+  .fireinfo .row + .row { border-top:1px solid #ebebe8; }
+  .fireinfo .lbl { color:#777; flex:none; min-width:88px; }
+  .fireinfo .val { color:#222; font-weight:600; text-align:right; flex:1; }
+  .fireinfo .contain-bar { height:6px; background:#e8e8e4; border-radius:3px; margin-top:5px; overflow:hidden; }
+  .fireinfo .contain-fill { height:100%; background:#1f7a4d; border-radius:3px; }
+  .fireinfo .status { display:inline-block; font-size:11px; font-weight:700; padding:2px 8px;
+    border-radius:8px; margin-top:6px; }
+  .fireinfo .status.active { background:#fde8e0; color:#b5321f; }
+  .fireinfo .status.partial { background:#fdf6e8; color:#9a6b00; }
+  .fireinfo .status.contained { background:#e3f4ea; color:#1a7a49; }
+  .fc .params { margin-top:10px; padding-top:10px; border-top:1px solid #eee; font-size:12px; color:#666; line-height:1.5; }
+  .fc .params b { color:#333; font-weight:600; }
   .x { position:absolute; top:14px; right:16px; font-size:18px; color:#aaa; }
   .btn { margin-top:14px; width:100%; border:0; border-radius:12px; background:var(--fire); color:#fff;
     font-size:16px; font-weight:600; padding:13px; }
@@ -64,6 +79,29 @@
     box-shadow:0 4px 14px rgba(0,0,0,.28); }
   .evacfab:active { background:#1a6640; }
   .evacfab:disabled { background:#8a8f8b; opacity:.85; box-shadow:0 2px 8px rgba(0,0,0,.18); }
+
+  /* Wide screens (tablet landscape / desktop): dock the sheet as a right-side
+     panel instead of a bottom sheet. Phones keep the thumb-reachable bottom sheet
+     above (the default styles). Keep PANEL_W in the script in sync with this width. */
+  @media (min-width: 768px) {
+    .search, .toast { transition: right .25s; }
+    /* Only shrink the top bar when the side panel is actually open, so a wide screen
+       with no panel keeps the full-width search bar. */
+    body.panel-open .search { right: 400px; }
+    body.panel-open .toast  { right: 400px; }
+    .sheet {
+      top: 0; bottom: 0; left: auto; right: 0;
+      width: 380px;
+      border-radius: 0;
+      padding: calc(env(safe-area-inset-top) + 18px) 20px calc(env(safe-area-inset-bottom) + 20px);
+      box-shadow: -3px 0 20px rgba(0,0,0,.2);
+      transform: translateX(110%);          /* hide to the side, not the bottom */
+      overflow-y: auto;                      /* forecast + routes can exceed viewport height */
+    }
+    .sheet.show { transform: translateX(0); }
+    .sheet.show.min { transform: translateX(0); }   /* no bottom-minimize on desktop */
+    .grip { display: none; }                         /* grip-drag gesture is mobile-only */
+  }
 </style>
 </head>
 <body>
@@ -86,7 +124,7 @@
   <div style="margin-top:4px"><i style="background:#b5321f;opacity:.35"></i>current fire footprint</div>
   <div style="margin-top:4px">
     <i style="background:#ffe66a;margin-right:1px"></i><i style="background:#ffb020;margin-right:1px"></i><i style="background:#ff7a00;margin-right:1px"></i><i style="background:#f23018;margin-right:1px"></i><i style="background:#a10000"></i>
-    fire intensity (low → extreme, zoom in)
+    🔥 fire intensity (low → extreme, zoom in)
   </div>
 </div>
 
@@ -94,11 +132,11 @@
   <div class="grip"></div>
   <span class="x" id="closeSheet">✕</span>
   <h2 id="fName">Fire</h2>
-  <div class="meta" id="fMeta"></div>
-  <div class="sub" id="fSub"></div>
+  <div class="fireinfo" id="fireInfo"></div>
   <button class="btn" id="predictBtn">Forecast spread →</button>
   <div class="fc" id="fc" style="display:none">
     <div class="lab" id="fcInfo"></div>
+    <div class="params" id="fcParams"></div>
     <div class="hourrow"><span class="lab">Forecast horizon</span><b id="hourLabel">+24h</b></div>
     <input id="hour" type="range" min="1" max="24" step="1" value="24">
     <div class="disc">Research estimate — wind-, fuel-, and terrain-driven ForeFire simulation. Not operational guidance.</div>
@@ -138,8 +176,24 @@ const STYLE = {
   ]
 };
 
-const map = new maplibregl.Map({ container:"map", style:STYLE, center:[-119.4,37.5], zoom:5.2 });
+// Open framed on the whole US + Canada rather than a single state, so every
+// active wildfire nationwide is in view on load. [[west,south],[east,north]].
+const US_CANADA_BOUNDS = [[-140, 22], [-52, 62]];
+const map = new maplibregl.Map({ container:"map", style:STYLE,
+  bounds:US_CANADA_BOUNDS, fitBoundsOptions:{ padding:20 } });
 map.addControl(new maplibregl.NavigationControl({ showCompass:false }), "bottom-right");
+
+// On wide screens the sheet docks as a right-side panel (see the @media block);
+// keep PANEL_W in sync with the CSS width so map framing pads around it and never
+// centers a fire/route behind the panel. On phones the sheet is a bottom sheet.
+const PANEL_W = 380;
+function isWide(){ return window.matchMedia("(min-width: 768px)").matches; }
+// fitBounds/flyTo padding: reserve room for the side panel on wide screens; on
+// phones fall back to a plain uniform padding (the bottom sheet is short).
+function framePad(base){
+  base = (base == null) ? 50 : base;
+  return isWide() ? { top:base, left:base, bottom:base, right:PANEL_W + 30 } : base;
+}
 
 // How many hours ahead to forecast (schema allows up to 48; the hourly wind
 // forecast supports up to 48h). Change this one value to adjust the horizon.
@@ -227,9 +281,20 @@ function drawFirePoints(){
   const pts = { type:"FeatureCollection", features: fires.map(f => ({
     type:"Feature", properties:{ id:f.id, name:f.name }, geometry:{ type:"Point", coordinates:[f.lon,f.lat] } })) };
   setSource("fires", pts, [
+    // A soft dark halo under the dot so it reads over bright terrain too.
+    { id:"fires-halo", type:"circle", source:"fires",
+      paint:{ "circle-radius":["interpolate",["linear"],["zoom"], 4,8, 8,11, 12,15],
+        "circle-color":"#000000","circle-opacity":0.28,"circle-blur":0.6 } },
     { id:"fires-dot", type:"circle", source:"fires",
-      paint:{ "circle-radius":6,"circle-color":"#d85a30","circle-stroke-color":"#fff","circle-stroke-width":1.5 } },
+      paint:{ "circle-radius":["interpolate",["linear"],["zoom"], 4,5.5, 8,7.5, 12,10],
+        "circle-color":"#ff2e12","circle-opacity":0.98,
+        "circle-stroke-color":"#ffffff","circle-stroke-width":2.2 } },
   ]);
+}
+// Keep the fire dots (and their halo) above other layers after they're added.
+function raiseFireDots(){
+  if(map.getLayer("fires-halo")) map.moveLayer("fires-halo");
+  if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
 }
 
 // Load EVERY ongoing US wildfire and show them all on the map (largest first).
@@ -251,10 +316,12 @@ const PERIM_ZOOM = 7.5;   // at/above this zoom, fetch crisp viewport perimeters
 
 function setPerimeters(fc){
   setSource("perimeters", fc || {type:"FeatureCollection",features:[]}, [
-    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#b5321f","fill-opacity":0.25 } },
-    { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#8f2417","line-width":1.5 } },
+    { id:"perim-fill", type:"fill", source:"perimeters", paint:{ "fill-color":"#c8301a","fill-opacity":0.35 } },
+    // Dark casing under a bright edge so the current footprint stands out on satellite.
+    { id:"perim-line-casing", type:"line", source:"perimeters", paint:{ "line-color":"#2a0700","line-width":4,"line-opacity":0.5,"line-blur":0.5 } },
+    { id:"perim-line", type:"line", source:"perimeters", paint:{ "line-color":"#ff7a1a","line-width":2.6,"line-opacity":1 } },
   ]);
-  if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
+  raiseFireDots(); // keep dots (and halo) on top
 }
 
 // Draw ALL current fire perimeters nationwide up front (no click needed).
@@ -280,7 +347,7 @@ async function refreshPerimeters(){
   try {
     const fc = await jget(`/perimeters/bbox?west=${w}&south=${s}&east=${e}&north=${n}&min_acres=10&offset=${offset}`);
     if (map.getSource("perimeters")) map.getSource("perimeters").setData(fc);
-    if (map.getLayer("fires-dot")) map.moveLayer("fires-dot");
+    raiseFireDots();
   } catch(err){ /* keep whatever is currently shown */ }
 }
 
@@ -297,22 +364,67 @@ async function refreshHotspots(){
   const w=b.getWest(), s=b.getSouth(), e=b.getEast(), n=b.getNorth();
   try {
     const fc = await jget(`/hotspots/bbox?west=${w}&south=${s}&east=${e}&north=${n}`);
+    ensureFlameIcons();   // register the flame symbol images before the layer uses them
     setSource("hotspots", fc, [
-      // Size + heat-colour each detection by Fire Radiative Power (FRP, MW) — a
-      // direct proxy for how intensely that pixel is burning — so the hottest,
-      // most active parts of the fire stand out from the smouldering edges.
-      { id:"hotspots-dot", type:"circle", source:"hotspots", paint:{
-          "circle-radius":[
+      // Draw each detection as a small flame symbol, picked by heat-colour bucket
+      // and sized by Fire Radiative Power (FRP, MW) — a direct proxy for how
+      // intensely that pixel is burning — so the hottest, most active parts of the
+      // fire stand out from the smouldering edges. (Layer id kept as
+      // "hotspots-dot" so the click/hover/dismiss handlers still target it.)
+      { id:"hotspots-dot", type:"symbol", source:"hotspots", layout:{
+          "icon-image":[
+            "step", ["to-number", ["get","frp"], 0],
+            "flame-0", 20,"flame-1", 60,"flame-2", 150,"flame-3", 400,"flame-4" ],
+          "icon-size":[
             "interpolate", ["linear"], ["to-number", ["get","frp"], 0],
-            0, 5,  20, 7.5,  75, 10,  200, 14,  500, 18 ],
-          "circle-color":[
-            "interpolate", ["linear"], ["to-number", ["get","frp"], 0],
-            0, "#ffd23f",  20, "#ff9500",  60, "#ff6a00",  150, "#ef2b12",  400, "#9e0000" ],
-          "circle-opacity":0.92,
-          "circle-stroke-color":"#2a0700", "circle-stroke-width":1 } },
+            0, 0.32,  20, 0.44,  75, 0.58,  200, 0.74,  500, 0.92 ],
+          "icon-anchor":"bottom",
+          "icon-allow-overlap":true, "icon-ignore-placement":true } },
     ]);
-    if (map.getLayer("fires-dot")) map.moveLayer("fires-dot"); // keep dots on top
+    raiseFireDots(); // keep dots on top
   } catch(err){ /* best-effort overlay */ }
+}
+
+// Flame symbol images for the hotspot layer, one per FRP heat-colour bucket. Drawn
+// once on a canvas (as an SDF-free tinted icon) and registered with the map. The
+// colour ramp matches the previous circle styling (yellow → deep red).
+const FLAME_COLORS = ["#ffd23f", "#ff9500", "#ff6a00", "#ef2b12", "#9e0000"];
+function makeFlameIcon(fill){
+  const W = 44, H = 56, ratio = 2;
+  const c = document.createElement("canvas");
+  c.width = W * ratio; c.height = H * ratio;
+  const ctx = c.getContext("2d");
+  ctx.scale(ratio, ratio);
+  // Teardrop flame with a small inner kink on the left, tip at the top.
+  ctx.beginPath();
+  ctx.moveTo(22, 3);
+  ctx.bezierCurveTo(27, 16, 39, 23, 35, 38);
+  ctx.bezierCurveTo(33, 48, 28, 53, 22, 53);
+  ctx.bezierCurveTo(16, 53, 9, 48, 8, 38);
+  ctx.bezierCurveTo(6, 28, 15, 23, 15, 12);
+  ctx.bezierCurveTo(17, 8, 19, 6, 22, 3);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#2a0700";
+  ctx.lineJoin = "round";
+  ctx.stroke();
+  // Inner highlight so brighter flames read as hotter.
+  ctx.beginPath();
+  ctx.moveTo(22, 20);
+  ctx.bezierCurveTo(26, 28, 28, 34, 24, 44);
+  ctx.bezierCurveTo(20, 40, 18, 34, 20, 28);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.fill();
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
+function ensureFlameIcons(){
+  FLAME_COLORS.forEach((col, i)=>{
+    const id = "flame-" + i;
+    if(!map.hasImage(id)) map.addImage(id, makeFlameIcon(col), { pixelRatio: 2 });
+  });
 }
 
 function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
@@ -383,14 +495,22 @@ const sheet = document.getElementById("sheet");
 const evacSheet = document.getElementById("evacSheet");
 // Bottom sheets are removed from the layout when closed (display:none) rather than
 // left parked off-screen — they only come back when their trigger is clicked again.
+// Reflects whether any sheet is open, so the side panel's layout (e.g. shrinking
+// the search bar on wide screens) only applies while a panel is actually shown.
+function syncPanelOpen(){
+  const open = sheet.classList.contains("show") || evacSheet.classList.contains("show");
+  document.body.classList.toggle("panel-open", open);
+}
 function showSheet(el){
   el.classList.remove("min");
   el.style.display = "block";
   void el.offsetWidth;                 // reflow so the slide-up transition plays from off-screen
   el.classList.add("show");
+  syncPanelOpen();
 }
 function hideSheet(el){
   el.classList.remove("show","min");
+  syncPanelOpen();
   // Remove it once it has slid out; skip if it was reopened during the transition.
   setTimeout(()=>{ if(!el.classList.contains("show")) el.style.display = "none"; }, 280);
 }
@@ -419,19 +539,65 @@ function updateEvacFab(){
   fab.textContent = near ? "Plan evacuation route" : `No fire within ${THREAT_ALERT_KM} km`;
 }
 function refreshEvac(){ updateEvacBtn(); updateEvacFab(); }
+function fmtState(s){ return s ? s.replace(/^US-/,"") : null; }
+function fmtDiscovered(iso){
+  if(!iso) return null;
+  try {
+    return new Date(iso).toLocaleDateString(undefined, { month:"short", day:"numeric", year:"numeric" });
+  } catch(e){ return null; }
+}
+// Map Canada's categorical stage of control to the same status styling buckets.
+function caStageStatus(stage){
+  const s = (stage||"").toLowerCase();
+  if(s.includes("out of control")) return { cls:"active", text:"Out of control" };
+  if(s.includes("being held"))     return { cls:"partial", text:"Being held" };
+  if(s.includes("under control"))  return { cls:"contained", text:"Under control" };
+  return { cls:"active", text:stage || "Active" };
+}
+function fireStatus(f){
+  // Canada reports a stage of control instead of a containment %.
+  if(f.percent_contained == null && f.stage_of_control) return caStageStatus(f.stage_of_control);
+  const p = f.percent_contained;
+  if(p != null && p >= 100) return { cls:"contained", text:"Fully contained" };
+  if(p != null && p > 0) return { cls:"partial", text:"Partially contained" };
+  return { cls:"active", text:"Active — spreading" };
+}
+function renderFireInfo(f){
+  const box = document.getElementById("fireInfo");
+  const rows = [];
+  // US incidents report county + state; Canadian ones report a province/agency.
+  const loc = f.country === "CA"
+    ? [fmtState(f.state), "Canada"].filter(Boolean).join(", ")
+    : [f.county, fmtState(f.state)].filter(Boolean).join(", ");
+  if(loc) rows.push(["Location", loc]);
+  if(f.size_acres != null)
+    rows.push(["Size", `${Number(f.size_acres).toLocaleString()} acres`]);
+  if(f.percent_contained != null){
+    const pct = Math.round(f.percent_contained);
+    rows.push(["Containment", `${pct}%<div class="contain-bar"><div class="contain-fill" style="width:${Math.min(100,pct)}%"></div></div>`]);
+  } else if(f.stage_of_control){
+    rows.push(["Stage of control", f.stage_of_control]);
+  }
+  const when = fmtDiscovered(f.discovery_time);
+  if(when) rows.push([f.country === "CA" ? "Started" : "Discovered", when]);
+  if(origin)
+    rows.push(["Distance", `${haversineKm(origin.lat, origin.lon, f.lat, f.lon).toFixed(1)} km from you`]);
+  const st = fireStatus(f);
+  const src = f.country === "CA" ? "🇨🇦 CWFIS (Canada)" : "🇺🇸 NIFC (US)";
+  box.innerHTML =
+    `<span class="status ${st.cls}">${st.text}</span>` +
+    rows.map(([lbl,val])=>`<div class="row"><span class="lbl">${lbl}</span><span class="val">${val}</span></div>`).join("") +
+    `<div class="row"><span class="lbl">Source</span><span class="val">${src}</span></div>`;
+}
 function openSheet(f){
   selected = f; prediction = null;
   clearInterval(animTimer); animTimer = null;
   ["iso-fill","iso-line"].forEach(id=>{ if(map.getLayer(id)) map.setLayoutProperty(id,"visibility","none"); });
   document.getElementById("legend").classList.remove("show");
   document.getElementById("fName").textContent = f.name;
-  const parts = [];
-  if (origin) parts.push(`${haversineKm(origin.lat, origin.lon, f.lat, f.lon).toFixed(1)} km away`);
-  if (f.size_acres != null) parts.push(`${Number(f.size_acres).toLocaleString()} acres`);
-  if (f.percent_contained != null) parts.push(`${f.percent_contained}% contained`);
-  document.getElementById("fMeta").textContent = parts.join(" · ");
-  document.getElementById("fSub").textContent = [f.county, f.state].filter(Boolean).join(", ");
+  renderFireInfo(f);
   document.getElementById("fc").style.display = "none";
+  document.getElementById("fcParams").textContent = "";
   // A 100%-contained fire has a complete control line and won't spread outward,
   // so a free-spread forecast is meaningless — disable it.
   const btn = document.getElementById("predictBtn");
@@ -455,8 +621,8 @@ function openSheet(f){
   // spread beyond the current perimeter without running off-screen.
   const pb = perimBounds[normName(f.name)];
   let box = pb || (f.size_acres != null ? boundsForAcres(f.lon, f.lat, f.size_acres) : null);
-  if (box) map.fitBounds(expandBounds(box, 1.8), { padding: 50, maxZoom: 12, duration: 800 });
-  else map.flyTo({ center:[f.lon,f.lat], zoom:10 });
+  if (box) map.fitBounds(expandBounds(box, 1.8), { padding: framePad(50), maxZoom: 12, duration: 800 });
+  else map.flyTo({ center:[f.lon,f.lat], zoom:10, padding: framePad(0) });
 }
 function closeSheet(){ hideSheet(sheet); selected=null;
   clearInterval(animTimer); animTimer=null;
@@ -477,6 +643,7 @@ async function runForecast(){
     if (prediction.contained || !(prediction.isochrones.features||[]).length){
       document.getElementById("fcInfo").textContent = (prediction.notes && prediction.notes[0])
         || "No spread forecast: this fire is reported fully contained.";
+      document.getElementById("fcParams").textContent = "";
       document.getElementById("fc").style.display = "block";
       btn.disabled = true; btn.textContent = "🛡️ No spread expected";
       return;
@@ -491,15 +658,26 @@ async function runForecast(){
     setSource("iso", prediction.isochrones, [
       { id:"iso-fill", type:"fill", source:"iso", paint:{
           "fill-color":fillColor, "fill-opacity":0.18 } },
-      { id:"iso-line", type:"line", source:"iso", paint:{ "line-color":"#e8613a","line-width":1,"line-opacity":0.5 } },
+      { id:"iso-line", type:"line", source:"iso", paint:{ "line-color":"#ff5a2a","line-width":1.8,"line-opacity":0.95 } },
     ]);
     // Keep fire dots above the fill.
-    if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
+    raiseFireDots();
     ["iso-fill","iso-line"].forEach(id=> map.setLayoutProperty(id,"visibility","visible"));
     const p = prediction.parameters;
-    document.getElementById("fcInfo").textContent =
-      `engine: ${prediction.engine} · ignition: ${p.ignition} · fuel ${p.fuel_model} · ` +
-      `wind ${Math.round(p.wind_speed_kmh)}→${Math.round(p.wind_end_speed_kmh)} km/h`;
+    document.getElementById("fcInfo").textContent = "Spread forecast loaded — drag the slider to see growth over time.";
+    const fuel = p.fuel_name ? `${p.fuel_name} (${p.fuel_model})` : (p.fuel_model || "—");
+    const windStart = Math.round(p.wind_speed_kmh);
+    const windEnd = Math.round(p.wind_end_speed_kmh);
+    const wind = windStart === windEnd ? `${windStart} km/h` : `${windStart} → ${windEnd} km/h`;
+    const slope = p.slope_percent != null ? `${Math.round(p.slope_percent)}%` : "—";
+    const ign = p.ignition === "perimeter" ? "mapped perimeter" : "incident point";
+    document.getElementById("fcParams").innerHTML =
+      `<div><b>Fuel:</b> ${fuel}</div>` +
+      `<div><b>Wind:</b> ${wind}</div>` +
+      `<div><b>Slope:</b> ${slope}</div>` +
+      `<div><b>Ignition:</b> ${ign}</div>` +
+      `<div><b>Engine:</b> ${prediction.engine}</div>` +
+      (prediction.notes||[]).map(n=>`<div style="margin-top:6px;color:#9a6b00">${n}</div>`).join("");
     const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
     document.getElementById("fc").style.display = "block";
     document.getElementById("predictBtn").style.display = "none";
@@ -556,7 +734,7 @@ function selectRoute(i, routes){
     map.setPaintProperty("evac-line","line-width",["case",["==",["get","idx"], i], 7, 3]);
     map.setPaintProperty("evac-line","line-opacity",["case",["==",["get","idx"], i], 1, 0.45]);
   }
-  const b=lineBounds(routes[i].geometry); if(b) map.fitBounds(b,{padding:60,duration:600});
+  const b=lineBounds(routes[i].geometry); if(b) map.fitBounds(b,{padding:framePad(60),duration:600});
 }
 
 function clearEvac(){
@@ -639,7 +817,7 @@ function renderRoutes(res, opts){
     paint:{ "circle-radius":7, "circle-color":["case",["get","shelter"],"#1f7a4d","#34a853"],
       "circle-stroke-width":2, "circle-stroke-color":"#fff" } });
   showMe(origin.lat, origin.lon);   // make sure your location is marked (the routes start here)
-  if(map.getLayer("fires-dot")) map.moveLayer("fires-dot");
+  raiseFireDots();
 
   box.innerHTML="";
   if(!routes.length){
@@ -666,7 +844,14 @@ function renderRoutes(res, opts){
 
   if(opts.refit !== false){
     const b=fitEvacBounds(routes, shownDests);
-    if(b) map.fitBounds(b,{ padding:{top:80,bottom:evacSheet.offsetHeight+20,left:40,right:40}, maxZoom:13, duration:800 });
+    if(b){
+      // On wide screens the panel is on the right; on phones it's a bottom sheet,
+      // so pad the bottom by the sheet height to keep routes above it.
+      const pad = isWide()
+        ? { top:80, bottom:40, left:40, right:PANEL_W + 30 }
+        : { top:80, bottom:evacSheet.offsetHeight + 20, left:40, right:40 };
+      map.fitBounds(b,{ padding:pad, maxZoom:13, duration:800 });
+    }
   }
 }
 
@@ -689,7 +874,7 @@ document.getElementById("evacFab").onclick = ()=> planEvacuation();          // 
 document.getElementById("closeEvac").onclick = closeEvacSheet;
 // Tap a sheet's grip handle to minimize it (reveal the full map) / restore it.
 document.querySelectorAll(".sheet .grip").forEach(g=>{
-  g.onclick = ()=> g.closest(".sheet").classList.toggle("min");
+  g.onclick = ()=>{ if(!isWide()) g.closest(".sheet").classList.toggle("min"); };  // minimize is bottom-sheet-only
 });
 
 // Dragging the slider takes over from the animation.

@@ -29,6 +29,27 @@ WFIGS_PERIMS_URL = (
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query"
 )
+# Canadian active wildfires (CWFIS-derived, hosted as an ArcGIS FeatureServer of
+# incident *points*). Fields: Fire_Name, Latitude, Longitude, Hectares__Ha_,
+# Stage_of_Control (OC/BH/UC) + SoC_Text, Start_Date (epoch ms), Agency (province).
+# Canada reports a stage of control, not a containment %, so percent_contained
+# stays None for these and stage_of_control carries the status.
+CA_FIRES_URL = (
+    "https://services.arcgis.com/fFPraSowbm3gs7ek/arcgis/rest/services/"
+    "ActiveWildfiresInCanada/FeatureServer/0/query"
+)
+# Canadian fire perimeters: CWFIS Fire M3 current-day estimates (polygons derived
+# from buffered season-to-date satellite hotspots), served as GeoServer WFS. These
+# are SATELLITE ESTIMATES, not agency-surveyed lines like the US perimeters — NRCan
+# labels them non-operational — but they're the best national footprint layer.
+# Attributes: uid, hcount, firstdate, lastdate, area (hectares).
+CA_PERIMS_URL = (
+    "https://cwfis.cfs.nrcan.gc.ca/geoserver/public/ows"
+    "?service=WFS&version=1.0.0&request=GetFeature"
+    "&typeName=public:m3_polygons_current&outputFormat=application/json&srsName=EPSG:4326"
+)
+HECTARES_TO_ACRES = 2.47105
+
 # NASA FIRMS area API (CSV). We use VIIRS aboard NOAA-20 — the primary
 # operational VIIRS satellite, with a denser/timelier NRT feed than the aging
 # Suomi-NPP. Day range is 2, not 1: NRT for the current day lags a few hours, so
@@ -335,11 +356,32 @@ async def nearby(lat: float, lon: float, radius_km: float) -> dict[str, Any]:
 
 async def all_active(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
     """
-    All current US wildfire incidents at/above `min_acres`, nationwide (no spatial
-    filter) — for showing every ongoing fire on the map at once. Points only
-    (no perimeters/hotspots) to keep the payload light. distance_km is 0 here
-    since there is no reference point; the client computes distance if it has one.
+    All current US + Canadian wildfire incidents at/above `min_acres`, nationwide
+    (no spatial filter) — for showing every ongoing fire on the map at once. Points
+    only (no perimeters/hotspots) to keep the payload light. Fetches both countries
+    concurrently; if one source fails the other is still returned. distance_km is 0
+    here since there is no reference point; the client computes distance if it has one.
     """
+    us, ca = await asyncio.gather(
+        all_active_us(min_acres=min_acres, limit=limit),
+        all_active_ca(min_acres=min_acres, limit=limit),
+        return_exceptions=True,
+    )
+    fires: list[Fire] = []
+    if isinstance(us, list):
+        fires.extend(us)
+    if isinstance(ca, list):
+        fires.extend(ca)
+    # If BOTH sources errored, surface the US error (the primary source) so the
+    # router still returns a clear 502 rather than an empty list.
+    if not isinstance(us, list) and not isinstance(ca, list):
+        raise us
+    fires.sort(key=lambda f: (f.size_acres or 0), reverse=True)
+    return fires[:limit]
+
+
+async def all_active_us(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
+    """All current US wildfire incidents (NIFC WFIGS points), largest first."""
     params = {
         "where": (
             "IncidentTypeCategory = 'WF' AND FireOutDateTime IS NULL "
@@ -376,17 +418,84 @@ async def all_active(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
             percent_contained=props.get("PercentContained"),
             discovery_time=_iso(props.get("FireDiscoveryDateTime")),
             county=props.get("POOCounty"), state=props.get("POOState"),
+            country="US",
+        ))
+    return fires
+
+
+async def all_active_ca(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
+    """
+    All current Canadian wildfire incidents (CWFIS ActiveWildfiresInCanada points),
+    largest first. Sizes come in hectares (converted to acres); containment is a
+    categorical stage of control, not a percentage.
+    """
+    min_ha = min_acres / HECTARES_TO_ACRES
+    params = {
+        "where": f"Hectares__Ha_ >= {min_ha}",
+        "outFields": ",".join([
+            "OBJECTID", "Fire_Name", "Hectares__Ha_", "SoC_Text",
+            "Start_Date", "Agency",
+        ]),
+        "orderByFields": "Hectares__Ha_ DESC",
+        "resultRecordCount": limit,
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "f": "geojson",
+    }
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        resp = await client.get(CA_FIRES_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    return _ca_fires_from_geojson(data)
+
+
+def _ca_fires_from_geojson(data: dict[str, Any]) -> list[Fire]:
+    """Map the Canadian FeatureServer GeoJSON into our Fire schema."""
+    fires: list[Fire] = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        geom = feat.get("geometry") or {}
+        coords = geom.get("coordinates") or [None, None]
+        f_lon, f_lat = coords[0], coords[1]
+        if f_lat is None or f_lon is None:
+            continue
+        ha = props.get("Hectares__Ha_")
+        size_acres = round(ha * HECTARES_TO_ACRES, 1) if ha is not None else None
+        # Fire_Name is often an agency code (e.g. "2025_BC_2025-C22340"); tidy the
+        # separators so it reads a little better in the UI.
+        raw_name = (props.get("Fire_Name") or "Unnamed incident").strip()
+        name = raw_name.replace("_", " ")
+        fires.append(Fire(
+            id=f"CA{props.get('OBJECTID')}",
+            name=name,
+            lat=f_lat, lon=f_lon, distance_km=0.0,
+            size_acres=size_acres,
+            percent_contained=None,   # Canada reports stage of control, not a %
+            discovery_time=_iso(props.get("Start_Date")),
+            county=None, state=props.get("Agency"),
+            country="CA",
+            stage_of_control=props.get("SoC_Text"),
         ))
     return fires
 
 
 async def all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
     """
-    All current US fire perimeters at/above `min_acres`, nationwide, as a GeoJSON
-    FeatureCollection — for drawing every mapped footprint on the overview map.
-    Geometry is simplified server-side (maxAllowableOffset) to keep the payload
-    reasonable; small fires usually have no mapped perimeter anyway.
+    All current US + Canadian fire perimeters at/above `min_acres`, nationwide, as a
+    GeoJSON FeatureCollection — for drawing every mapped footprint on the overview
+    map. US geometry is simplified server-side to keep the payload reasonable.
+    Canadian footprints are best-effort: if that source fails, US perimeters still
+    return (and vice versa).
     """
+    us, ca = await asyncio.gather(
+        _us_all_perimeters(min_acres=min_acres, limit=limit),
+        _ca_perimeters(min_acres=min_acres),
+        return_exceptions=True,
+    )
+    return _merge_perimeter_fcs(us, ca)
+
+
+async def _us_all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
     params = {
         "where": f"poly_GISAcres >= {min_acres}",
         "outFields": "OBJECTID,poly_IncidentName,poly_GISAcres",
@@ -407,10 +516,11 @@ async def perimeters_in_bbox(
     min_acres: float = 10.0, offset: float = 0.0, limit: int = 1500,
 ) -> dict[str, Any]:
     """
-    Current fire perimeters intersecting a lon/lat bounding box, as GeoJSON.
-    `offset` is maxAllowableOffset in degrees (0 = full resolution); the caller
-    sets it to about a pixel's worth so a zoomed-in view stays crisp while the
-    payload stays small.
+    Current US + Canadian fire perimeters intersecting a lon/lat bounding box, as
+    GeoJSON. `offset` is maxAllowableOffset in degrees (0 = full resolution) for the
+    US layer; the caller sets it to about a pixel's worth so a zoomed-in view stays
+    crisp while the payload stays small. Canadian footprints are clipped to the bbox
+    client-side and are best-effort.
     """
     params = {
         "where": f"poly_GISAcres >= {min_acres}",
@@ -426,10 +536,92 @@ async def perimeters_in_bbox(
     }
     if offset and offset > 0:
         params["maxAllowableOffset"] = str(offset)
+
+    async def _us():
+        async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+            resp = await client.get(WFIGS_PERIMS_URL, params=params)
+            resp.raise_for_status()
+            return resp.json()
+
+    us, ca = await asyncio.gather(
+        _us(),
+        _ca_perimeters(min_acres=min_acres, bbox=(west, south, east, north)),
+        return_exceptions=True,
+    )
+    return _merge_perimeter_fcs(us, ca)
+
+
+def _merge_perimeter_fcs(us: Any, ca: Any) -> dict[str, Any]:
+    """Combine US + Canadian perimeter results, tolerating a failure of either."""
+    features: list[dict[str, Any]] = []
+    if isinstance(us, dict):
+        features.extend(us.get("features") or [])
+    if isinstance(ca, dict):
+        features.extend(ca.get("features") or [])
+    # If both failed, surface the US error so the router returns a clear 502.
+    if not isinstance(us, dict) and not isinstance(ca, dict):
+        if isinstance(us, BaseException):
+            raise us
+    return {"type": "FeatureCollection", "features": features}
+
+
+async def _ca_perimeters(
+    min_acres: float = 100.0,
+    bbox: Optional[tuple[float, float, float, float]] = None,
+) -> dict[str, Any]:
+    """
+    Canadian Fire M3 perimeter estimates as GeoJSON, normalised to the same
+    properties the US perimeters use (poly_IncidentName, poly_GISAcres) so the map
+    styles them identically. Filtered by size and, when given, clipped to a bbox.
+    """
+    min_ha = min_acres / HECTARES_TO_ACRES
     async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
-        resp = await client.get(WFIGS_PERIMS_URL, params=params)
+        resp = await client.get(CA_PERIMS_URL)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+
+    feats: list[dict[str, Any]] = []
+    for feat in data.get("features", []):
+        props = feat.get("properties") or {}
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        area_ha = props.get("area")
+        if area_ha is not None and area_ha < min_ha:
+            continue
+        if bbox is not None and not _geom_intersects_bbox(geom, bbox):
+            continue
+        feats.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "OBJECTID": props.get("uid"),
+                "poly_IncidentName": None,
+                "poly_GISAcres": round(area_ha * HECTARES_TO_ACRES, 1) if area_ha is not None else None,
+                "source": "CWFIS-M3",   # satellite-estimated, not agency-surveyed
+            },
+        })
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def _geom_intersects_bbox(geom: dict[str, Any], bbox: tuple[float, float, float, float]) -> bool:
+    """Cheap bbox-vs-geometry-bounds overlap test (no shapely needed)."""
+    west, south, east, north = bbox
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def _walk(c):
+        if isinstance(c, (int, float)):
+            return
+        if c and isinstance(c[0], (int, float)) and len(c) >= 2:
+            xs.append(c[0]); ys.append(c[1]); return
+        for sub in c:
+            _walk(sub)
+
+    _walk(geom.get("coordinates") or [])
+    if not xs:
+        return False
+    return not (max(xs) < west or min(xs) > east or max(ys) < south or min(ys) > north)
 
 
 async def nearest_perimeter_geometry(
@@ -446,9 +638,20 @@ async def nearest_perimeter_geometry(
     """
     from shapely.geometry import Point, shape
 
+    # Fire could be in the US (WFIGS) or Canada (CWFIS M3) — check both near the
+    # point. A small bbox around the point clips the Canadian layer cheaply.
+    d = radius_km / 111.0
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
-        fc = await _fetch_perimeters(client, lat, lon, radius_km, offset=offset)
-    feats = fc.get("features") or []
+        us_fc, ca_fc = await asyncio.gather(
+            _fetch_perimeters(client, lat, lon, radius_km, offset=offset),
+            _ca_perimeters(min_acres=0.0, bbox=(lon - d, lat - d, lon + d, lat + d)),
+            return_exceptions=True,
+        )
+    feats = []
+    if isinstance(us_fc, dict):
+        feats.extend(us_fc.get("features") or [])
+    if isinstance(ca_fc, dict):
+        feats.extend(ca_fc.get("features") or [])
     if not feats:
         return None
 

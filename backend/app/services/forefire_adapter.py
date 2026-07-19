@@ -734,11 +734,35 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
         })
 
     if not features:
-        raise ForeFireUnavailable(
-            "ForeFire produced no fire fronts — the fire may not have spread "
-            f"under {prop_model} with fuel {fuel_code} (index {fuel_int}). "
-            "Check the fuel/wind inputs."
+        # No fronts across every step. If the ignition seeded correctly, this is a
+        # legitimate physical outcome — the fuel simply doesn't spread under the
+        # current winds and (RH-driven) fuel moisture. Grass/shrub models like GR2
+        # have a low moisture of extinction, so a humid or calm hour yields zero
+        # rate of spread. Return a valid "no spread" forecast (empty isochrones)
+        # rather than an error so the client can say so plainly. Only a genuine
+        # seeding failure (no nodes) is surfaced as an error below.
+        if n_seed <= 0:
+            raise ForeFireUnavailable(
+                "ForeFire could not seed a fire front from the ignition perimeter "
+                f"(fuel {fuel_code}, index {fuel_int}). The perimeter geometry may "
+                "be invalid or outside the fuel domain."
+            )
+        log.warning(
+            "ForeFire produced no fire fronts for fuel %s (index %d) — no spread "
+            "under the current winds/fuel moisture. Returning a no-spread forecast.",
+            fuel_code, fuel_int,
         )
+        return {
+            "type": "FeatureCollection",
+            "features": [],
+            "properties": {
+                "model": f"forefire-{prop_model.lower()}",
+                "steps": 0,
+                "seeded_from_perimeter": initial_polygon is not None,
+                "no_spread": True,
+                "fuel_code": fuel_code,
+            },
+        }
 
     # Report how much the fire grew, but do NOT reject a slow fire. A large
     # perimeter under light wind legitimately only gains a thin rind over a few
@@ -842,6 +866,29 @@ async def predict(req: PredictRequest) -> PredictResponse:
         # Don't block the event loop waiting on the (possibly still-running)
         # child; it is single-use and will exit on its own.
         pool.shutdown(wait=False, cancel_futures=True)
+
+    # No spread at all: the fuel doesn't propagate under the current winds and
+    # fuel moisture (e.g. a grass model on a humid/calm hour). This is a valid
+    # outcome, not an error — return empty isochrones with a plain-language note so
+    # the map can say "no spread expected" instead of surfacing a failure.
+    if result.get("properties", {}).get("no_spread"):
+        series = inputs["wind_series"]
+        wind_kmh = round(series[0][0], 0)
+        fm1 = inputs.get("moisture", {}).get("ones")
+        detail = f"winds near {wind_kmh:.0f} km/h"
+        if fm1 is not None:
+            detail += f" and ~{fm1 * 100:.0f}% dead fuel moisture"
+        notes.insert(
+            0,
+            f"No spread expected: {inputs['fuel']['name']} ({inputs['fuel']['code']}) "
+            f"does not propagate under the current conditions ({detail}).",
+        )
+        return PredictResponse(
+            engine="forefire",
+            parameters=_params(req, inputs),
+            isochrones={"type": "FeatureCollection", "features": []},
+            notes=notes,
+        )
 
     if result.get("properties", {}).get("low_spread"):
         notes.append(
