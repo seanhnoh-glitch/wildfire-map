@@ -10,6 +10,7 @@ API can fan out to the sources concurrently.
 """
 import asyncio
 import math
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -479,30 +480,55 @@ def _ca_fires_from_geojson(data: dict[str, Any]) -> list[Fire]:
     return fires
 
 
-async def all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
-    """
-    All current US + Canadian fire perimeters at/above `min_acres`, nationwide, as a
-    GeoJSON FeatureCollection — for drawing every mapped footprint on the overview
-    map. US geometry is simplified server-side to keep the payload reasonable.
-    Canadian footprints are best-effort: if that source fails, US perimeters still
-    return (and vice versa).
-    """
-    us, ca = await asyncio.gather(
-        _us_all_perimeters(min_acres=min_acres, limit=limit),
-        _ca_perimeters(min_acres=min_acres),
-        return_exceptions=True,
-    )
-    return _merge_perimeter_fcs(us, ca)
+# --- Perimeter snapshot cache ---------------------------------------------
+# Every map pan/zoom used to hit the WFIGS ArcGIS service directly and uncached,
+# so a burst of panning (or the 5-min auto-refresh racing a pan) could trip
+# ArcGIS rate limits / timeouts — the request then returned empty and the map's
+# perimeter overlay blanked. Instead we fetch the WHOLE nationwide perimeter set
+# ONCE, cache it in memory, and answer every /perimeters/all and /perimeters/bbox
+# request from that snapshot (filtering by acreage / viewport in-process). The
+# upstream service is hit at most once per _PERIM_TTL_S regardless of how much the
+# user pans, and if a refresh fails we keep serving the last good snapshot
+# (stale-while-error) so the overlay never blanks.
+_PERIM_TTL_S = 90.0
+_PERIM_MIN_ACRES = 1.0           # include even small fires so nothing is missing
+_PERIM_OFFSET = 0.0004           # ~40 m simplification: crisp at any app zoom, ~0.5 MB total
+_PERIM_FETCH_LIMIT = 4000
+# Parallel index of (bbox=(w,s,e,n), acres, feature) for fast viewport filtering.
+_perim_index: Optional[list[tuple[tuple[float, float, float, float], float, dict]]] = None
+_perim_fetched_at = 0.0
+_perim_lock = asyncio.Lock()
 
 
-async def _us_all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
+def _geom_bbox(geom: Optional[dict]) -> Optional[tuple[float, float, float, float]]:
+    """(west, south, east, north) of any GeoJSON geometry, or None if empty."""
+    if not geom:
+        return None
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def walk(c):
+        if isinstance(c, (list, tuple)):
+            if c and isinstance(c[0], (int, float)):
+                xs.append(c[0]); ys.append(c[1])
+            else:
+                for sub in c:
+                    walk(sub)
+
+    walk(geom.get("coordinates"))
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+async def _fetch_all_perimeters_raw() -> dict[str, Any]:
     params = {
-        "where": f"poly_GISAcres >= {min_acres}",
+        "where": f"poly_GISAcres >= {_PERIM_MIN_ACRES}",
         "outFields": "OBJECTID,poly_IncidentName,poly_GISAcres",
         "returnGeometry": "true",
-        "maxAllowableOffset": "0.005",   # ~500 m simplification (degrees at 4326)
+        "maxAllowableOffset": str(_PERIM_OFFSET),
         "outSR": "4326",
-        "resultRecordCount": limit,
+        "resultRecordCount": _PERIM_FETCH_LIMIT,
         "f": "geojson",
     }
     async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
@@ -511,68 +537,13 @@ async def _us_all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dic
         return resp.json()
 
 
-async def perimeters_in_bbox(
-    west: float, south: float, east: float, north: float,
-    min_acres: float = 10.0, offset: float = 0.0, limit: int = 1500,
-) -> dict[str, Any]:
+async def _ca_perimeters(min_acres: float = 0.0) -> dict[str, Any]:
     """
-    Current US + Canadian fire perimeters intersecting a lon/lat bounding box, as
-    GeoJSON. `offset` is maxAllowableOffset in degrees (0 = full resolution) for the
-    US layer; the caller sets it to about a pixel's worth so a zoomed-in view stays
-    crisp while the payload stays small. Canadian footprints are clipped to the bbox
-    client-side and are best-effort.
-    """
-    params = {
-        "where": f"poly_GISAcres >= {min_acres}",
-        "geometry": f"{west},{south},{east},{north}",
-        "geometryType": "esriGeometryEnvelope",
-        "inSR": "4326",
-        "spatialRel": "esriSpatialRelIntersects",
-        "outFields": "OBJECTID,poly_IncidentName,poly_GISAcres",
-        "returnGeometry": "true",
-        "outSR": "4326",
-        "resultRecordCount": limit,
-        "f": "geojson",
-    }
-    if offset and offset > 0:
-        params["maxAllowableOffset"] = str(offset)
-
-    async def _us():
-        async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
-            resp = await client.get(WFIGS_PERIMS_URL, params=params)
-            resp.raise_for_status()
-            return resp.json()
-
-    us, ca = await asyncio.gather(
-        _us(),
-        _ca_perimeters(min_acres=min_acres, bbox=(west, south, east, north)),
-        return_exceptions=True,
-    )
-    return _merge_perimeter_fcs(us, ca)
-
-
-def _merge_perimeter_fcs(us: Any, ca: Any) -> dict[str, Any]:
-    """Combine US + Canadian perimeter results, tolerating a failure of either."""
-    features: list[dict[str, Any]] = []
-    if isinstance(us, dict):
-        features.extend(us.get("features") or [])
-    if isinstance(ca, dict):
-        features.extend(ca.get("features") or [])
-    # If both failed, surface the US error so the router returns a clear 502.
-    if not isinstance(us, dict) and not isinstance(ca, dict):
-        if isinstance(us, BaseException):
-            raise us
-    return {"type": "FeatureCollection", "features": features}
-
-
-async def _ca_perimeters(
-    min_acres: float = 100.0,
-    bbox: Optional[tuple[float, float, float, float]] = None,
-) -> dict[str, Any]:
-    """
-    Canadian Fire M3 perimeter estimates as GeoJSON, normalised to the same
+    Canadian Fire M3 perimeter estimates as GeoJSON, normalised to the SAME
     properties the US perimeters use (poly_IncidentName, poly_GISAcres) so the map
-    styles them identically. Filtered by size and, when given, clipped to a bbox.
+    styles them identically and the shared snapshot cache / bbox filter treat them
+    the same. These are satellite-derived estimates (source=CWFIS-M3), not agency-
+    surveyed lines like the US perimeters.
     """
     min_ha = min_acres / HECTARES_TO_ACRES
     async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
@@ -589,8 +560,6 @@ async def _ca_perimeters(
         area_ha = props.get("area")
         if area_ha is not None and area_ha < min_ha:
             continue
-        if bbox is not None and not _geom_intersects_bbox(geom, bbox):
-            continue
         feats.append({
             "type": "Feature",
             "geometry": geom,
@@ -604,57 +573,112 @@ async def _ca_perimeters(
     return {"type": "FeatureCollection", "features": feats}
 
 
-def _geom_intersects_bbox(geom: dict[str, Any], bbox: tuple[float, float, float, float]) -> bool:
-    """Cheap bbox-vs-geometry-bounds overlap test (no shapely needed)."""
-    west, south, east, north = bbox
-    xs: list[float] = []
-    ys: list[float] = []
+async def _perimeter_index() -> list[tuple[tuple[float, float, float, float], float, dict]]:
+    """The cached nationwide (US + Canada) perimeter index, refreshed at most every
+    _PERIM_TTL_S. On a refresh failure the previous snapshot is kept and served stale
+    rather than letting the overlay blank; only a cold-start failure (no snapshot
+    yet) raises. The Canadian source is best-effort — if it fails, US perimeters
+    still populate the index (and vice versa)."""
+    global _perim_index, _perim_fetched_at
+    now = time.monotonic()
+    if _perim_index is not None and (now - _perim_fetched_at) < _PERIM_TTL_S:
+        return _perim_index
+    async with _perim_lock:
+        now = time.monotonic()
+        if _perim_index is not None and (now - _perim_fetched_at) < _PERIM_TTL_S:
+            return _perim_index                       # another task refreshed while we waited
+        try:
+            us_fc, ca_fc = await asyncio.gather(
+                _fetch_all_perimeters_raw(),
+                _ca_perimeters(),
+                return_exceptions=True,
+            )
+            # A cold start with both sources down has nothing to serve → re-raise.
+            if not isinstance(us_fc, dict) and not isinstance(ca_fc, dict):
+                raise us_fc if isinstance(us_fc, BaseException) else ca_fc
+            merged: list[dict] = []
+            if isinstance(us_fc, dict):
+                merged.extend(us_fc.get("features") or [])
+            if isinstance(ca_fc, dict):
+                merged.extend(ca_fc.get("features") or [])
+            index = []
+            for f in merged:
+                bb = _geom_bbox(f.get("geometry"))
+                if bb is None:
+                    continue
+                acres = (f.get("properties") or {}).get("poly_GISAcres") or 0.0
+                index.append((bb, float(acres), f))
+            _perim_index = index
+            _perim_fetched_at = time.monotonic()
+        except Exception:
+            if _perim_index is None:
+                raise                                 # nothing to fall back to on a cold start
+            # Keep serving stale data, but retry sooner than a full TTL from now.
+            _perim_fetched_at = time.monotonic() - _PERIM_TTL_S + 15.0
+        return _perim_index
 
-    def _walk(c):
-        if isinstance(c, (int, float)):
-            return
-        if c and isinstance(c[0], (int, float)) and len(c) >= 2:
-            xs.append(c[0]); ys.append(c[1]); return
-        for sub in c:
-            _walk(sub)
 
-    _walk(geom.get("coordinates") or [])
-    if not xs:
+async def all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
+    """
+    All current US fire perimeters at/above `min_acres`, nationwide, as a GeoJSON
+    FeatureCollection — for drawing every mapped footprint on the overview map.
+    Served from the in-memory snapshot (see _perimeter_index); geometry is
+    pre-simplified to ~40 m to keep the payload reasonable.
+    """
+    index = await _perimeter_index()
+    feats = [f for (_bb, acres, f) in index if acres >= min_acres][:limit]
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def _bbox_overlaps(a: tuple[float, float, float, float], w: float, s: float, e: float, n: float) -> bool:
+    return not (a[2] < w or a[0] > e or a[3] < s or a[1] > n)
+
+
+def _snapshot_bbox(index, west, south, east, north, min_acres, limit):
+    feats = [
+        f for (bb, acres, f) in index
+        if acres >= min_acres and _bbox_overlaps(bb, west, south, east, north)
+    ][:limit]
+    return {"type": "FeatureCollection", "features": feats}
+
+
+async def perimeters_in_bbox(
+    west: float, south: float, east: float, north: float,
+    min_acres: float = 10.0, offset: float = 0.0, limit: int = 1500,
+) -> dict[str, Any]:
+    """
+    Current fire perimeters (US + Canada) intersecting a lon/lat bounding box, as
+    GeoJSON, served from the single cached nationwide snapshot (see _perimeter_index).
+    The snapshot is kept at ~40 m resolution, so zoomed-in views are crisp WITHOUT a
+    per-pan live ArcGIS query (which rate-limited under burst and made the overlay
+    coarse or blank when it failed). Serving both the map draw AND the forecast button
+    from this one source means they can never disagree. `offset` is accepted for API
+    compatibility but ignored — the snapshot resolution is fixed.
+    """
+    index = await _perimeter_index()
+    return _snapshot_bbox(index, west, south, east, north, min_acres, limit)
+
+
+async def has_perimeter_near(lat: float, lon: float, radius_km: float = 8.0) -> bool:
+    """True when the fire at (lat, lon) has an official mapped perimeter to ignite
+    from. This is the SAME check the /predict no-perimeter guard uses, so the UI's
+    forecast button always matches what a forecast would actually do."""
+    from . import spread_model
+    try:
+        geom = await nearest_perimeter_geometry(lat, lon, radius_km=radius_km)
+    except Exception:
         return False
-    return not (max(xs) < west or min(xs) > east or max(ys) < south or min(ys) > north)
+    return geom is not None and spread_model.perimeter_to_polygon(geom) is not None
 
 
-async def nearest_perimeter_geometry(
-    lat: float, lon: float, radius_km: float = 10.0, offset: float = 0.0
-) -> Optional[dict[str, Any]]:
-    """
-    Return the perimeter geometry belonging to the clicked fire, for ignition.
-
-    Among the mapped perimeters near the point we pick the one that CONTAINS the
-    point (a fire's incident location sits within its own footprint); if none
-    contains it, we pick the genuinely closest. This avoids seeding the forecast
-    from a neighbouring fire's perimeter when several are nearby — which makes the
-    forecast start from the wrong shape.
-    """
+def _pick_perimeter(feats: list, lon: float, lat: float,
+                    max_dist_deg: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """From candidate perimeter features pick the one CONTAINING the point (a fire's
+    own footprint), else the genuinely closest — so we don't seed from a neighbour.
+    If `max_dist_deg` is given, a non-containing nearest beyond that distance is
+    rejected (returns None), so a fire with no perimeter of its own doesn't pick up a
+    distant neighbour's perimeter just because their bounding boxes overlapped."""
     from shapely.geometry import Point, shape
-
-    # Fire could be in the US (WFIGS) or Canada (CWFIS M3) — check both near the
-    # point. A small bbox around the point clips the Canadian layer cheaply.
-    d = radius_km / 111.0
-    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
-        us_fc, ca_fc = await asyncio.gather(
-            _fetch_perimeters(client, lat, lon, radius_km, offset=offset),
-            _ca_perimeters(min_acres=0.0, bbox=(lon - d, lat - d, lon + d, lat + d)),
-            return_exceptions=True,
-        )
-    feats = []
-    if isinstance(us_fc, dict):
-        feats.extend(us_fc.get("features") or [])
-    if isinstance(ca_fc, dict):
-        feats.extend(ca_fc.get("features") or [])
-    if not feats:
-        return None
-
     pt = Point(lon, lat)
     closest_geom = None
     closest_dist = float("inf")
@@ -669,8 +693,45 @@ async def nearest_perimeter_geometry(
         except Exception:
             continue
         if poly.contains(pt):
-            return geom                     # point inside → this is the fire's own perimeter
-        d = pt.distance(poly)               # planar degrees; fine for ranking nearby polys
+            return geom
+        d = pt.distance(poly)
         if d < closest_dist:
             closest_dist, closest_geom = d, geom
-    return closest_geom or feats[0].get("geometry")
+    if max_dist_deg is not None and closest_dist > max_dist_deg:
+        return None
+    return closest_geom
+
+
+async def _snapshot_perimeter_geometry(
+    lat: float, lon: float, radius_km: float = 8.0
+) -> Optional[dict[str, Any]]:
+    """Perimeter geometry for the fire at (lat, lon) from the cached nationwide
+    snapshot (see _perimeter_index) — fast and reliable, and identical to what the
+    map draws. None if the snapshot has no perimeter within the radius."""
+    index = await _perimeter_index()
+    if not index:
+        return None
+    deg = radius_km / 111.0
+    box = (lon - deg, lat - deg, lon + deg, lat + deg)
+    cand = [f for (bb, _ac, f) in index if _bbox_overlaps(bb, *box)]
+    return _pick_perimeter(cand, lon, lat, max_dist_deg=deg)
+
+
+async def nearest_perimeter_geometry(
+    lat: float, lon: float, radius_km: float = 10.0, offset: float = 0.0
+) -> Optional[dict[str, Any]]:
+    """
+    Return the perimeter geometry belonging to the clicked fire, for ignition.
+
+    Served from the cached nationwide snapshot first (fast, reliable, and identical
+    to what the map draws) so the forecast button, the /predict no-perimeter guard,
+    and the ignition all agree and don't flap when the live ArcGIS service is slow.
+    Falls back to a live point query only if the snapshot has nothing (e.g. a fire
+    whose perimeter is below the snapshot's size floor, or a cold cache).
+    """
+    geom = await _snapshot_perimeter_geometry(lat, lon, radius_km=radius_km)
+    if geom is not None:
+        return geom
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        fc = await _fetch_perimeters(client, lat, lon, radius_km, offset=offset)
+    return _pick_perimeter(fc.get("features") or [], lon, lat)

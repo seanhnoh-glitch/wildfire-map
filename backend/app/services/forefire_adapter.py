@@ -9,6 +9,7 @@ Build requirements: ForeFire must be compiled from source. Use the Docker image
 (backend/Dockerfile) or follow docs/FOREFIRE_SETUP.md for WSL/Linux.
 """
 import asyncio
+import datetime
 import logging
 import math
 import multiprocessing
@@ -21,6 +22,8 @@ from ..config import get_settings
 from ..schemas import PredictRequest, PredictResponse
 from . import fires as fires_svc
 from . import fuel as fuel_svc
+from . import ml_correction
+from . import spotting
 from . import spread_model
 from . import terrain as terrain_svc
 from . import weather as weather_svc
@@ -140,65 +143,119 @@ def _steps(req: PredictRequest) -> int:
     return max(1, int(round(req.duration_hours * 60 / req.step_minutes)))
 
 
-async def _build_wind_series(req: PredictRequest, notes: list[str]) -> tuple[list[tuple[float, float]], str]:
-    """
-    Produce one (speed_kmh, dir_from_deg) per forecast step.
+def _gust_blend(speed_kmh: float, gust_kmh, factor: float) -> float:
+    """Effective driving wind = sustained + factor·(gust − sustained). The hourly-mean
+    wind under-represents the gusts that carry fire runs; blending in the gust closes
+    that gap. factor 0 = sustained only. Missing/lower gust falls back to sustained."""
+    if not factor or gust_kmh is None:
+        return speed_kmh
+    return speed_kmh + factor * max(0.0, float(gust_kmh) - speed_kmh)
 
-      - supplied wind_series -> used directly (hindcast), padded/truncated to n
+
+# Fire-weather regime — a Hot-Dry-Windy-style index HDW = VPD(kPa) × wind(m/s). The
+# free-spread model (with gusts + spotting) is well calibrated on hot-dry-windy RUN
+# days but over-predicts calm/humid days (real fires are held by higher humidity,
+# diurnal calming, and suppression the model ignores). So we scale the model's
+# aggressiveness by the regime: full on high-HDW days, damped on low-HDW days.
+# Thresholds from real-perimeter validation — the worst over-predictor (Soberanes,
+# humid coast) had HDW ~7; well-calibrated run days (Carr) ~40–56.
+_HDW_LO = 8.0
+_HDW_HI = 38.0
+
+
+def _regime_factor(temp_c, rh_pct, peak_wind_kmh) -> float:
+    """Fire-weather aggressiveness in [0,1] from HDW. Unknown weather → 0.5 (neutral)."""
+    if temp_c is None or rh_pct is None:
+        return 0.5
+    svp = 0.6108 * math.exp(17.27 * temp_c / (temp_c + 237.3))   # sat. vapour pressure, kPa
+    vpd = max(0.0, svp * (1.0 - float(rh_pct) / 100.0))
+    hdw = vpd * (peak_wind_kmh / 3.6)
+    return max(0.0, min(1.0, (hdw - _HDW_LO) / (_HDW_HI - _HDW_LO)))
+
+
+async def _build_wind_series(req: PredictRequest, notes: list[str]):
+    """
+    Produce the wind ForeFire runs on, plus the RAW wind for ML features.
+
+      - supplied wind_series -> hindcast; 3-col [sustained,dir,gust] is blended here,
+        2-col [speed,dir] is treated as already-blended (backward compatible)
       - explicit override  -> constant wind, repeated for every step
-      - use_forecast_wind  -> HRRR-backed hourly forecast, sampled per step
+      - use_forecast_wind  -> HRRR-backed hourly forecast, gust-blended per step
       - otherwise / on error -> constant current wind
 
-    Returns (series, wind_source_label).
+    Returns (series [(speed_kmh, dir)] fed to ForeFire, wind_source_label,
+    raw_series [[sustained_kmh, dir, gust_kmh], ...] for ml_correction.wind_features).
     """
     n = _steps(req)
+    gust_factor = get_settings().wind_gust_factor
+
+    def _fit(seq):
+        return seq[:n] if len(seq) >= n else seq + [seq[-1]] * (n - len(seq))
 
     if req.wind_series:
-        series = [(float(s[0]), float(s[1])) for s in req.wind_series if len(s) >= 2]
-        if not series:
-            series = [(15.0, 270.0)]
-        series = (series[:n] if len(series) >= n else series + [series[-1]] * (n - len(series)))
+        raw = []
+        for s in req.wind_series:
+            if len(s) >= 3:
+                raw.append([float(s[0]), float(s[1]), float(s[2])])
+            elif len(s) >= 2:
+                raw.append([float(s[0]), float(s[1]), float(s[0])])   # no gust column
+        if not raw:
+            raw = [[15.0, 270.0, 15.0]]
+        has_gust = any(len(s) >= 3 for s in req.wind_series)
+        if has_gust:                                   # caller sent raw gusts → blend here
+            series = [(_gust_blend(r[0], r[2], gust_factor), r[1]) for r in raw]
+        else:                                          # already blended by the caller
+            series = [(r[0], r[1]) for r in raw]
+        series = _fit(series)                          # ForeFire uses n steps; wind
+                                                       # FEATURES use the full raw window
+                                                       # (matches the training pipeline)
         notes.append(
             f"Supplied historical wind series: start {series[0][0]:.0f} km/h @ "
             f"{series[0][1]:.0f}deg -> end {series[-1][0]:.0f} km/h @ {series[-1][1]:.0f}deg."
         )
-        return series, "historical (supplied)"
+        return series, "historical (supplied)", raw
 
     if req.wind_speed_kmh is not None and req.wind_direction_deg is not None:
-        notes.append(
-            f"Wind held constant at {req.wind_speed_kmh:.0f} km/h @ {req.wind_direction_deg:.0f}deg (override)."
-        )
-        return [(req.wind_speed_kmh, req.wind_direction_deg)] * n, "override (constant)"
+        s, d = float(req.wind_speed_kmh), float(req.wind_direction_deg)
+        notes.append(f"Wind held constant at {s:.0f} km/h @ {d:.0f}deg (override).")
+        return [(s, d)] * n, "override (constant)", [[s, d, s]] * n
 
     if req.use_forecast_wind:
         try:
             hourly = await weather_svc.forecast_hourly(req.lat, req.lon, int(req.duration_hours) + 1)
-            series: list[tuple[float, float]] = []
+            series, raw = [], []
             for k in range(n):
-                hour_idx = min(len(hourly) - 1, int((k * req.step_minutes) // 60))
-                h = hourly[hour_idx]
-                series.append((float(h["wind_speed_kmh"]), float(h["wind_direction_deg"])))
+                h = hourly[min(len(hourly) - 1, int((k * req.step_minutes) // 60))]
+                sus, dr = float(h["wind_speed_kmh"]), float(h["wind_direction_deg"])
+                gu = h.get("wind_gust_kmh")
+                series.append((_gust_blend(sus, gu, gust_factor), dr))
+                raw.append([sus, dr, float(gu) if gu is not None else sus])
             first, last = series[0], series[-1]
+            gust_note = f" (gusts blended, factor {gust_factor:.1f})" if gust_factor else ""
             notes.append(
                 f"HRRR-backed forecast wind: start {first[0]:.0f} km/h @ {first[1]:.0f}deg -> "
-                f"end {last[0]:.0f} km/h @ {last[1]:.0f}deg."
+                f"end {last[0]:.0f} km/h @ {last[1]:.0f}deg{gust_note}."
             )
-            return series, "Open-Meteo hourly (HRRR-backed)"
+            return series, "Open-Meteo hourly (HRRR-backed)", raw
         except Exception as exc:
             notes.append(f"Forecast wind unavailable ({exc}); using constant current wind.")
 
     wx = await weather_svc.current(req.lat, req.lon)
     speed = wx.wind_speed_kmh if wx.wind_speed_kmh is not None else 15.0
     direction = wx.wind_direction_deg if wx.wind_direction_deg is not None else 270.0
-    notes.append(f"Current wind from {wx.source}: {speed:.0f} km/h @ {direction:.0f}deg (held constant).")
-    return [(speed, direction)] * n, wx.source
+    gust = float(wx.wind_gust_kmh) if wx.wind_gust_kmh is not None else speed
+    eff = _gust_blend(speed, wx.wind_gust_kmh, gust_factor)
+    gust_note = f" (gust-blended {eff:.0f} km/h)" if eff > speed + 0.5 else ""
+    notes.append(f"Current wind from {wx.source}: {speed:.0f} km/h @ {direction:.0f}deg (held constant){gust_note}.")
+    return [(eff, direction)] * n, wx.source, [[speed, direction, gust]] * n
 
 
 async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
     """Resolve the wind series, fuel, and slope, using overrides when provided."""
     notes: list[str] = []
 
-    wind_series, wind_source = await _build_wind_series(req, notes)
+    wind_series, wind_source, raw_wind = await _build_wind_series(req, notes)
+    wind_feats = ml_correction.wind_features(raw_wind)   # canonical, matches training
 
     fuel_code = req.fuel_model or await fuel_svc.fuel_at(req.lat, req.lon)
     fuel_params = fuel_svc.get_params(fuel_code)
@@ -216,29 +273,74 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
             slope, uphill_bearing = res
             notes.append(f"Local slope {slope:.0f}%, uphill toward {uphill_bearing:.0f}deg.")
 
-    # Fuel moisture. Supplied temperature/RH (hindcast) take priority; otherwise
-    # live conditions — dead fine fuels respond quickly to humidity and strongly
-    # affect rate of spread. Best-effort; falls back to a dry default.
+    # Fuel moisture. Dead fine-fuel moisture: supplied temperature/RH (hindcast)
+    # take priority, else live conditions — dead fine fuels respond quickly to
+    # humidity and strongly affect rate of spread. Live moisture is seasonal, keyed
+    # to the fire's month (current month for a live forecast; season_month override
+    # for a hindcast). Best-effort; falls back to a dry default.
+    month = req.season_month or datetime.datetime.utcnow().month
+    temp_used = rh_used = None
     if req.temperature_c is not None and req.relative_humidity is not None:
-        moisture = _fuel_moisture_from_weather(req.temperature_c, req.relative_humidity)
+        temp_used, rh_used = req.temperature_c, req.relative_humidity
+        moisture = _fuel_moisture_from_weather(req.temperature_c, req.relative_humidity, month, req.lat)
         notes.append(
             f"Fuel moisture from supplied RH {req.relative_humidity:.0f}% → "
-            f"1-h dead {moisture['ones'] * 100:.0f}%."
+            f"1-h dead {moisture['ones'] * 100:.0f}%; live herbaceous "
+            f"{moisture['liveh'] * 100:.0f}% (month {month})."
         )
     else:
         try:
             wx = await weather_svc.current(req.lat, req.lon)
-            moisture = _fuel_moisture_from_weather(wx.temperature_c, wx.relative_humidity)
+            temp_used, rh_used = wx.temperature_c, wx.relative_humidity
+            moisture = _fuel_moisture_from_weather(wx.temperature_c, wx.relative_humidity, month, req.lat)
             if wx.relative_humidity is not None:
                 notes.append(
                     f"Fuel moisture from {wx.source}: RH {wx.relative_humidity:.0f}% "
-                    f"→ 1-h dead {moisture['ones'] * 100:.0f}%."
+                    f"→ 1-h dead {moisture['ones'] * 100:.0f}%; live herbaceous "
+                    f"{moisture['liveh'] * 100:.0f}% (month {month})."
                 )
             else:
                 notes.append("Humidity unavailable; used default dry fuel moisture.")
         except Exception:
-            moisture = dict(_DEFAULT_MOISTURE)
+            lh, lw = _seasonal_live_moisture(month, req.lat)
+            moisture = dict(_DEFAULT_MOISTURE, liveh=lh, livew=lw)
             notes.append("Live conditions for fuel moisture unavailable; used dry defaults.")
+
+    # Fire-weather regime: damp the model's aggressiveness on calm/humid days (where
+    # free-spread over-predicts) and keep it full on hot-dry-windy run days. Scales
+    # the driving wind (a suppression/calming proxy) and the spotting reach.
+    regime = 0.5
+    if get_settings().regime_scaling:
+        _rs = get_settings()
+        peak_wind = max((s[0] for s in wind_series), default=15.0)
+        regime = _regime_factor(temp_used, rh_used, peak_wind)
+        wind_mult = _rs.regime_wind_min + (_rs.regime_wind_max - _rs.regime_wind_min) * regime
+        if abs(wind_mult - 1.0) > 0.001:
+            wind_series = [(s * wind_mult, d) for s, d in wind_series]
+        # Spotting reach scales with regime, boosted on the most extreme days (adds
+        # lateral fan area where the surface model under-predicts a run).
+        spot_scale = regime * (1.0 + (_rs.regime_spot_boost - 1.0) * regime)
+        notes.append(
+            f"Fire-weather regime {regime:.2f} (0=calm/humid, 1=hot-dry-windy): "
+            f"driving wind ×{wind_mult:.2f}, spotting reach ×{spot_scale:.2f}."
+        )
+    else:
+        spot_scale = regime
+
+    # Suppression: a free-spread model over-predicts fires that crews/control lines
+    # are holding. Damp the driving wind by a suppression signal — supplied directly
+    # (validation: recent growth momentum), else derived from reported containment.
+    if get_settings().suppression_scaling:
+        supp = req.suppression
+        if supp is None and req.percent_contained:
+            supp = (req.percent_contained / 100.0) * get_settings().containment_to_suppression
+        supp = max(0.0, min(1.0, supp)) if supp is not None else 0.0
+        if supp > 0.01:
+            supp_mult = 1.0 - get_settings().suppression_damp * supp
+            wind_series = [(s * supp_mult, d) for s, d in wind_series]
+            notes.append(
+                f"Suppression {supp:.2f} (0=free-burning, 1=held): driving wind ×{supp_mult:.2f}."
+            )
 
     origin_lat, origin_lon = req.lat, req.lon
     initial_polygon = None
@@ -251,7 +353,7 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
             ignition = "supplied-geometry"
             notes.append("Ignited from supplied geometry (hindcast).")
         else:
-            notes.append("Supplied ignition geometry unusable; ignited from the point.")
+            notes.append("Supplied ignition geometry unusable.")
     elif req.ignite_from_perimeter:
         try:
             geom = await fires_svc.nearest_perimeter_geometry(req.lat, req.lon, radius_km=8.0)
@@ -261,27 +363,46 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
                 ignition = "perimeter"
                 notes.append("Ignited from mapped NIFC perimeter (fire's current footprint).")
             else:
-                notes.append("No usable perimeter nearby; ignited from the point.")
+                notes.append("No mapped perimeter available for this fire.")
         except Exception as exc:
             notes.append(f"Perimeter lookup failed ({exc}); ignited from the point.")
 
-    # Spatially-varying fuel: sample the LANDFIRE fuel raster across the whole
-    # domain so water / urban / rock become non-burnable barriers the fire stops
-    # at (instead of a single fuel type filling everything). Best-effort; on
-    # failure _run_forefire falls back to a uniform fuel map.
+    # Spatially-varying fuel AND terrain across the whole domain (fetched together):
+    #  - fuel: the LANDFIRE raster so water/urban/rock become non-burnable barriers
+    #    the fire stops at (instead of one fuel type filling everything).
+    #  - elevation: a real USGS 3DEP DEM so ForeFire derives local slope/aspect per
+    #    node (canyons, chimneys, ridges) rather than a single domain-wide plane.
+    # Both are best-effort; on failure _run_forefire falls back to a uniform fuel
+    # map / a tilted plane respectively.
     domain_half, fire_half = _domain_extents(initial_polygon)
-    fuel_grid = None
+    fuel_grid = elev_grid = None
     try:
         sw_lon, sw_lat = local_meters_to_lonlat(origin_lat, origin_lon, -domain_half, -domain_half)
         ne_lon, ne_lat = local_meters_to_lonlat(origin_lat, origin_lon, domain_half, domain_half)
-        fuel_grid = await fuel_svc.fuel_grid(sw_lon, sw_lat, ne_lon, ne_lat)
+        _cfg = get_settings()
+        want_dem = _cfg.terrain_dem
+        fuel_grid, elev_grid = await asyncio.gather(
+            fuel_svc.fuel_grid(sw_lon, sw_lat, ne_lon, ne_lat, sample_count=_cfg.fuel_grid_samples),
+            terrain_svc.elevation_grid(sw_lon, sw_lat, ne_lon, ne_lat, n=_cfg.elev_grid_n) if want_dem
+            else asyncio.sleep(0, result=None),
+            return_exceptions=True,
+        )
+        if isinstance(fuel_grid, Exception):
+            fuel_grid = None
+        if isinstance(elev_grid, Exception):
+            elev_grid = None
         if fuel_grid:
             notes.append(
                 f"Fuel map: {fuel_grid['ncols']}×{fuel_grid['nrows']} LANDFIRE grid, "
                 f"{fuel_grid['nonburn_pct']:.0f}% non-burnable barrier (water/urban/rock)."
             )
+        if elev_grid:
+            notes.append(
+                f"Terrain: {elev_grid['ncols']}×{elev_grid['nrows']} Copernicus DEM grid, "
+                f"{elev_grid['relief_m']:.0f} m relief — ForeFire derives per-node slope/aspect."
+            )
     except Exception:
-        fuel_grid = None
+        fuel_grid = elev_grid = None
 
     return {
         "wind_series": wind_series,
@@ -296,6 +417,12 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
         "domain_half": domain_half,
         "fire_half": fire_half,
         "fuel_grid": fuel_grid,
+        "elev_grid": elev_grid,
+        "regime": regime,
+        "spot_scale": spot_scale,
+        "temp_used": temp_used,
+        "rh_used": rh_used,
+        "wind_feats": wind_feats,
         "ignition": ignition,
         "notes": notes,
     }
@@ -306,30 +433,62 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 # Fallback dead/live fuel moisture fractions when live weather is unavailable
-# (a dry fire-weather assumption).
+# (a dry fire-weather assumption). Live values here are only the last-resort
+# fallback; the normal path uses the seasonal curve below.
 _DEFAULT_MOISTURE: dict[str, float] = {
     "ones": 0.06, "tens": 0.07, "hundreds": 0.08, "liveh": 0.70, "livew": 0.90,
 }
 
+# Representative seasonal live-fuel moisture (fraction of dry weight), by month for
+# the Northern Hemisphere, tuned to the WESTERN US fire season: a short spring
+# green-up (Mar–May) then rapid curing so that by peak season (Jul–Sep) live
+# herbaceous is dry (~35%) and behaves as available fuel. Live woody varies less.
+# Live fuel moisture is seasonal, not driven by the current RH — so keying it to the
+# fire's month is far better than a fixed year-round value (a fixed 0.70 over-wets
+# cured summer fuels and under-predicts peak-season runs; an earlier version that
+# kept June green at 0.90 measurably hurt June fires against real perimeters, hence
+# the earlier curing here). Not a substitute for live NFMD samples, but a defensible
+# default. Southern-Hemisphere months are shifted six months.
+_LIVE_HERB_BY_MONTH = [0.50, 0.55, 0.80, 1.10, 1.00, 0.60, 0.40, 0.35, 0.35, 0.45, 0.50, 0.50]
+_LIVE_WOODY_BY_MONTH = [0.85, 0.85, 0.95, 1.10, 1.10, 0.90, 0.80, 0.75, 0.75, 0.80, 0.85, 0.85]
 
-def _fuel_moisture_from_weather(temp_c, rh_pct) -> dict[str, float]:
-    """
-    Estimate dead + live fuel moisture (fractions) from current temperature and
-    relative humidity via the Simard (1968) equilibrium-moisture-content model
-    — the basis of NFDRS fine dead-fuel moisture. Dead fine fuels equilibrate
-    quickly to the air, so 1-h moisture ≈ EMC; 10-h and 100-h lag slightly
-    wetter. Live fuel moisture is seasonal (not driven by instantaneous RH), so
-    we keep representative fixed values.
 
-    Falls back to _DEFAULT_MOISTURE if inputs are missing or implausible.
+def _seasonal_live_moisture(month, lat) -> tuple[float, float]:
+    """(live herbaceous, live woody) moisture fractions for a month and latitude."""
+    try:
+        m = int(month)
+    except (TypeError, ValueError):
+        m = datetime.datetime.utcnow().month
+    if lat is not None and lat < 0:               # Southern Hemisphere: shift 6 months
+        m = ((m - 1 + 6) % 12) + 1
+    i = max(0, min(11, m - 1))
+    return _LIVE_HERB_BY_MONTH[i], _LIVE_WOODY_BY_MONTH[i]
+
+
+def _fuel_moisture_from_weather(temp_c, rh_pct, month=None, lat=None) -> dict[str, float]:
     """
+    Estimate dead + live fuel moisture (fractions). Dead fine-fuel moisture comes
+    from temperature and relative humidity via the Simard (1968) equilibrium-
+    moisture-content model (the basis of NFDRS fine dead-fuel moisture): dead fine
+    fuels equilibrate quickly to the air, so 1-h ≈ EMC and 10-h/100-h lag slightly
+    wetter. Live fuel moisture is seasonal (not driven by instantaneous RH), so it
+    comes from the month-keyed curve (_seasonal_live_moisture).
+
+    Falls back to dry dead-fuel defaults if temp/RH are missing or implausible, but
+    still applies the seasonal live values.
+    """
+    liveh, livew = _seasonal_live_moisture(month, lat)
     if temp_c is None or rh_pct is None:
-        return dict(_DEFAULT_MOISTURE)
+        d = dict(_DEFAULT_MOISTURE)
+        d["liveh"], d["livew"] = liveh, livew
+        return d
     try:
         h = max(1.0, min(100.0, float(rh_pct)))
         t_f = float(temp_c) * 9.0 / 5.0 + 32.0
     except (TypeError, ValueError):
-        return dict(_DEFAULT_MOISTURE)
+        d = dict(_DEFAULT_MOISTURE)
+        d["liveh"], d["livew"] = liveh, livew
+        return d
 
     if h < 10.0:
         emc = 0.03229 + 0.281073 * h - 0.000578 * h * t_f
@@ -343,8 +502,8 @@ def _fuel_moisture_from_weather(temp_c, rh_pct) -> dict[str, float]:
         "ones": round(fm1 / 100.0, 4),
         "tens": round(min(40.0, fm1 + 1.0) / 100.0, 4),
         "hundreds": round(min(40.0, fm1 + 2.0) / 100.0, 4),
-        "liveh": _DEFAULT_MOISTURE["liveh"],
-        "livew": _DEFAULT_MOISTURE["livew"],
+        "liveh": liveh,
+        "livew": livew,
     }
 
 
@@ -521,11 +680,13 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
                            rock become barriers the fire stops at (uniform if the
                            grid fetch failed)
       * moistures.*      = dead fuel moisture from live temperature/humidity
-                           (Simard EMC); live moisture fixed seasonal values
+                           (Simard EMC); live moisture from a month-keyed seasonal
+                           curve (herbaceous curing)
       * wind             = HRRR-backed hourly forecast, reduced from 10 m to
                            midflame (per-fuel WAF), re-triggered each step so the
                            head bends as the wind shifts
-      * slope            = tilted plane along the real terrain aspect
+      * elevation        = real USGS 3DEP DEM grid so ForeFire derives per-node
+                           slope/aspect (falls back to a tilted plane)
       * ignition         = a real FireFront (see _seed_firefront)
 
     Domain: a square of local metres centred on the fire, sized to contain the
@@ -559,7 +720,7 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     # with _gather_inputs so the fuel grid covers the same box).
     half = inputs["domain_half"]
     fire_half = inputs["fire_half"]
-    grid_n = 100
+    grid_n = max(20, get_settings().forefire_grid_n)
     swx = swy = -half
     lx = ly = 2.0 * half
     extent_m = lx
@@ -590,13 +751,17 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     # Scaling resolution with the fire's radius keeps the node count — and thus
     # the work per step — roughly constant regardless of fire size, so all steps
     # complete. Small fires stay at the 200 m floor; huge ones coarsen to ~2.5 km.
-    perim_res = min(2500.0, max(200.0, fire_half / 90.0))
+    _s = get_settings()
+    perim_res = min(_s.forefire_perim_res_max, max(_s.forefire_perim_res_min, fire_half / _s.forefire_perim_res_div))
     ff["spatialIncrement"] = max(10.0, perim_res / 20.0)
     ff["minimalPropagativeFrontDepth"] = max(100.0, perim_res * 0.5)
     ff["perimeterResolution"] = perim_res
     ff["minSpeed"] = 0.0
     ff["relax"] = 0.5
     ff["smoothing"] = 0
+    # Engine-side 10 m→midflame reduction is DISABLED (factor 1.0); we apply the
+    # per-fuel WAF once ourselves below. Setting this to 1.0 is what prevents the
+    # wind from being double-reduced — do not also reduce it here.
     ff["windReductionFactor"] = 1.0
     ff["bmapLayer"] = 1
     ff["SWx"] = swx
@@ -641,21 +806,31 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     ff.addScalarLayer("windScalDir", "windU", swx, swy, 0, lx, ly, 0, windU)
     ff.addScalarLayer("windScalDir", "windV", swx, swy, 0, lx, ly, 0, windV)
 
-    # Elevation — a tilted plane whose gradient magnitude equals the local slope
-    # and whose uphill direction is the real aspect from terrain.py, so the model
-    # gets both the right slope strength AND the right direction of upslope
-    # spread. If aspect is unknown (slope override or lookup failure) we leave it
-    # flat rather than fabricate a direction.
-    slope_frac = inputs["slope_percent"] / 100.0
-    uphill = inputs.get("uphill_bearing_deg")
-    alt_map = np.zeros((1, 1, grid_n, grid_n))
-    if uphill is not None and slope_frac > 0:
-        urad = math.radians(uphill)
-        ux, uy = math.sin(urad), math.cos(urad)          # unit uphill (east, north)
-        xs = swx + (np.arange(grid_n) + 0.5) * cell       # east per column
-        ys = swy + (np.arange(grid_n) + 0.5) * cell       # north per row
-        gx, gy = np.meshgrid(xs, ys)                       # gx[iy,ix]=east, gy[iy,ix]=north
-        alt_map[0, 0] = slope_frac * (gx * ux + gy * uy)
+    # Elevation. Preferred: a real USGS 3DEP DEM grid across the domain, so ForeFire
+    # computes the local slope AND aspect at every node from true micro-topography
+    # (canyons, chimneys, ridges) — the terrain complexity its front-tracking engine
+    # is built to exploit. Row 0 of the grid is the south edge, matching the fuel
+    # layer and ForeFire's sw-origin convention.
+    #
+    # Fallback (no DEM grid): a single tilted plane whose gradient magnitude equals
+    # the point-sampled slope and whose uphill direction is the point aspect — the
+    # right slope strength and upslope direction, but domain-uniform. If aspect is
+    # unknown (slope override / lookup failure) we leave it flat.
+    elev_grid = inputs.get("elev_grid")
+    if elev_grid:
+        er, ec = elev_grid["nrows"], elev_grid["ncols"]
+        alt_map = np.array(elev_grid["values"], dtype=float).reshape(1, 1, er, ec)
+    else:
+        slope_frac = inputs["slope_percent"] / 100.0
+        uphill = inputs.get("uphill_bearing_deg")
+        alt_map = np.zeros((1, 1, grid_n, grid_n))
+        if uphill is not None and slope_frac > 0:
+            urad = math.radians(uphill)
+            ux, uy = math.sin(urad), math.cos(urad)          # unit uphill (east, north)
+            xs = swx + (np.arange(grid_n) + 0.5) * cell       # east per column
+            ys = swy + (np.arange(grid_n) + 0.5) * cell       # north per row
+            gx, gy = np.meshgrid(xs, ys)                       # gx[iy,ix]=east, gy[iy,ix]=north
+            alt_map[0, 0] = slope_frac * (gx * ux + gy * uy)
     ff.addScalarLayer("data", "altitude", swx, swy, 0, lx, ly, 0, alt_map)
 
     # --- Ignition: seed a real propagating FireFront ---
@@ -664,11 +839,16 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
         fuel_desc = f"grid {fuel_grid['ncols']}x{fuel_grid['nrows']} ({fuel_grid['nonburn_pct']:.0f}% barrier)"
     else:
         fuel_desc = "uniform"
+    if elev_grid:
+        terrain_desc = f"DEM {elev_grid['ncols']}x{elev_grid['nrows']} ({elev_grid['relief_m']:.0f}m relief)"
+    else:
+        terrain_desc = (f"tilted plane {inputs['slope_percent']:.0f}%@"
+                        + (f"{inputs.get('uphill_bearing_deg'):.0f}deg"
+                           if inputs.get("uphill_bearing_deg") is not None else "flat"))
     log.info(
-        "ForeFire start: model=%s fuel=%s(%d) map=%s waf=%.2f slope=%.0f%%@%s "
+        "ForeFire start: model=%s fuel=%s(%d) map=%s terrain=%s waf=%.2f "
         "steps=%d seed_nodes=%d perim_ignite=%s domain_half=%.0f km",
-        prop_model, fuel_code, fuel_int, fuel_desc, waf, inputs["slope_percent"],
-        f"{uphill:.0f}deg" if uphill is not None else "flat",
+        prop_model, fuel_code, fuel_int, fuel_desc, terrain_desc, waf,
         len(wind_series), n_seed, initial_polygon is not None, half / 1000.0,
     )
 
@@ -677,7 +857,16 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     last_ring: list[list[float]] | None = None
     current_t = 0.0
     t0 = time.monotonic()
-    budget = _FF_TIME_BUDGET_S
+    budget = get_settings().forefire_time_budget_s
+
+    # Crown-fire spotting enhancement (off by default). Uses the AMBIENT 10 m wind
+    # (speed_kmh, not the midflame-reduced wind) since embers are lofted by the wind
+    # aloft, and the 1-h dead fuel moisture to gate receptivity. spot_prev carries
+    # the previous step's enhanced footprint so the isochrones stay nested.
+    spotting_on = get_settings().crown_spotting
+    dead_1h = (moisture or {}).get("ones")
+    spot_regime = inputs.get("spot_scale", inputs.get("regime", 1.0))   # regime-scaled spotting reach
+    spot_prev = None
 
     for step_idx, (speed_kmh, dir_from) in enumerate(wind_series, start=1):
         elapsed = time.monotonic() - t0
@@ -700,6 +889,18 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
             ring, area_km2 = last_ring, (
                 _ring_area_km2(last_ring, origin_lat, origin_lon) if last_ring else 0.0
             )
+        # Crown-fire spotting: broaden the surface front with a downwind ember fan
+        # (see spotting.py). Recompute area from the enhanced ring.
+        if ring is not None and spotting_on:
+            try:
+                ring, spot_prev = spotting.enhance_ring(
+                    ring, origin_lat, origin_lon, speed_kmh, (dir_from + 180.0) % 360.0,
+                    fuel_code, dead_1h, spot_prev, intensity=spot_regime,
+                )
+                area_km2 = _ring_area_km2(ring, origin_lat, origin_lon)
+            except Exception as exc:            # spotting is an enhancement — never fail on it
+                log.warning("spotting enhancement failed at step %d (%s); using raw front.",
+                            step_idx, exc)
         head_km = _ring_head_km(ring, origin_lat, origin_lon) if ring else 0.0
         # Directional diagnostic: downwind vs backing extent. downwind >> backing
         # means wind is driving the spread; ~equal means isotropic growth.
@@ -734,35 +935,65 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
         })
 
     if not features:
-        # No fronts across every step. If the ignition seeded correctly, this is a
-        # legitimate physical outcome — the fuel simply doesn't spread under the
-        # current winds and (RH-driven) fuel moisture. Grass/shrub models like GR2
-        # have a low moisture of extinction, so a humid or calm hour yields zero
-        # rate of spread. Return a valid "no spread" forecast (empty isochrones)
-        # rather than an error so the client can say so plainly. Only a genuine
-        # seeding failure (no nodes) is surfaced as an error below.
+        # No fronts across every step. A genuine seeding failure (no nodes placed)
+        # is a real error and always raises.
         if n_seed <= 0:
             raise ForeFireUnavailable(
                 "ForeFire could not seed a fire front from the ignition perimeter "
                 f"(fuel {fuel_code}, index {fuel_int}). The perimeter geometry may "
                 "be invalid or outside the fuel domain."
             )
-        log.warning(
-            "ForeFire produced no fire fronts for fuel %s (index %d) — no spread "
-            "under the current winds/fuel moisture. Returning a no-spread forecast.",
-            fuel_code, fuel_int,
-        )
-        return {
-            "type": "FeatureCollection",
-            "features": [],
-            "properties": {
-                "model": f"forefire-{prop_model.lower()}",
-                "steps": 0,
-                "seeded_from_perimeter": initial_polygon is not None,
-                "no_spread": True,
-                "fuel_code": fuel_code,
-            },
-        }
+        if initial_polygon is not None:
+            # Seeded from a real perimeter but modeled zero spread — wet/sparse fuel
+            # (e.g. TL5 timber litter) under light wind genuinely may not advance over
+            # a few hours. Return the CURRENT perimeter as a static forecast so the
+            # map still shows the footprint rather than failing.
+            static_ring = [
+                list(local_meters_to_lonlat(origin_lat, origin_lon, x, y))
+                for x, y in initial_polygon.exterior.coords
+            ]
+            area_km2 = _ring_area_km2(static_ring, origin_lat, origin_lon)
+            minutes = len(wind_series) * req.step_minutes
+            log.warning(
+                "ForeFire modeled no spread for fuel %s (index %d) under light wind — "
+                "returning the static current perimeter (%.2f km²) as the forecast.",
+                fuel_code, fuel_int, area_km2,
+            )
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [static_ring]},
+                "properties": {
+                    "step": len(wind_series),
+                    "minutes": minutes,
+                    "hours": round(minutes / 60.0, 2),
+                    "head_distance_km": 0.0,
+                    "area_km2": round(area_km2, 3),
+                    "wind_speed_kmh": round(wind_series[-1][0], 1),
+                    "wind_from_deg": round(wind_series[-1][1], 1),
+                    "static_no_spread": True,
+                },
+            })
+        else:
+            # Ignited from a bare point that caught but never advanced (grass/shrub
+            # models like GR2 have a low moisture of extinction, so a humid or calm
+            # hour yields zero rate of spread). Nothing to draw — return a valid
+            # "no spread" forecast with empty isochrones so the client can say so.
+            log.warning(
+                "ForeFire produced no fire fronts for fuel %s (index %d) — no spread "
+                "under the current winds/fuel moisture. Returning a no-spread forecast.",
+                fuel_code, fuel_int,
+            )
+            return {
+                "type": "FeatureCollection",
+                "features": [],
+                "properties": {
+                    "model": f"forefire-{prop_model.lower()}",
+                    "steps": 0,
+                    "seeded_from_perimeter": False,
+                    "no_spread": True,
+                    "fuel_code": fuel_code,
+                },
+            }
 
     # Report how much the fire grew, but do NOT reject a slow fire. A large
     # perimeter under light wind legitimately only gains a thin rind over a few
@@ -822,18 +1053,39 @@ async def predict(req: PredictRequest) -> PredictResponse:
             contained=True,
         )
 
+    # No-perimeter guard: a live map forecast ignites from the fire's official mapped
+    # perimeter. Many fires (state/prescribed, freshly reported) have only an incident
+    # point + acreage and no perimeter polygon — a point-seeded forecast for them is
+    # misleading, so we decline to forecast rather than fabricate one. (Hindcasts that
+    # pass an explicit ignition_geojson are exempt.)
+    if req.ignite_from_perimeter and req.ignition_geojson is None:
+        try:
+            geom = await fires_svc.nearest_perimeter_geometry(req.lat, req.lon, radius_km=8.0)
+        except Exception:
+            geom = None
+        if geom is None or spread_model.perimeter_to_polygon(geom) is None:
+            return PredictResponse(
+                engine="forefire",
+                parameters={"origin": {"lat": req.lat, "lon": req.lon}},
+                isochrones={"type": "FeatureCollection", "features": []},
+                notes=[
+                    "No official mapped perimeter is available for this fire, so its "
+                    "spread can't be forecasted. Only fires with a mapped perimeter "
+                    "(footprint) can be modeled."
+                ],
+                no_perimeter=True,
+            )
+
     inputs = await _gather_inputs(req)
     notes = list(inputs["notes"])
 
-    # Partial containment: the free-spread model has no concept of a control line,
-    # so it will overstate growth on the lined portion of the perimeter. We can't
-    # place the line spatially (only a single % is reported), so we keep the physics
-    # honest and flag the forecast as a worst case proportional to containment.
-    if req.percent_contained is not None and req.percent_contained > 0:
+    # (The free-spread / worst-case caveat is shown once in the UI disclaimer rather
+    # than repeated as a per-forecast note.)
+
+    if get_settings().crown_spotting:
         notes.append(
-            f"This fire is reported {req.percent_contained:.0f}% contained. The "
-            "forecast assumes free spread and does not model control lines, so it "
-            "likely overstates growth along contained edges — read it as a worst case."
+            "Crown-fire ember spotting is enabled: the surface footprint is broadened "
+            "with a downwind ember fan in crownable fuels under dry, windy conditions."
         )
 
     if not _forefire_available():
@@ -849,7 +1101,7 @@ async def predict(req: PredictRequest) -> PredictResponse:
     # single-use process per request is the reliable way to isolate a native,
     # non-reentrant library. The hard timeout guards against a runaway step.
     loop = asyncio.get_running_loop()
-    hard_timeout = _FF_TIME_BUDGET_S + 60.0
+    hard_timeout = get_settings().forefire_time_budget_s + 60.0
     pool = ProcessPoolExecutor(max_workers=1, mp_context=_MP_SPAWN)
     try:
         result = await asyncio.wait_for(
@@ -867,10 +1119,10 @@ async def predict(req: PredictRequest) -> PredictResponse:
         # child; it is single-use and will exit on its own.
         pool.shutdown(wait=False, cancel_futures=True)
 
-    # No spread at all: the fuel doesn't propagate under the current winds and
-    # fuel moisture (e.g. a grass model on a humid/calm hour). This is a valid
-    # outcome, not an error — return empty isochrones with a plain-language note so
-    # the map can say "no spread expected" instead of surfacing a failure.
+    # No spread at all AND nothing to draw (a bare-point ignition that caught but the
+    # fuel doesn't propagate under the current winds/moisture, e.g. grass on a humid
+    # hour). Valid outcome, not an error — return empty isochrones with a plain-
+    # language note so the map can say "no spread expected" instead of a failure.
     if result.get("properties", {}).get("no_spread"):
         series = inputs["wind_series"]
         wind_kmh = round(series[0][0], 0)
@@ -890,18 +1142,75 @@ async def predict(req: PredictRequest) -> PredictResponse:
             notes=notes,
         )
 
-    if result.get("properties", {}).get("low_spread"):
+    # Seeded from a real perimeter but modeled zero spread: the forecast is the
+    # fire's current (static) perimeter. Note it and skip ML rescaling below.
+    feats = result.get("features") or []
+    static = bool(feats) and all(
+        (f.get("properties") or {}).get("static_no_spread") for f in feats
+    )
+    if static:
+        notes.append(
+            "ForeFire modeled no outward spread over this horizon — the fuel here "
+            "(wet/sparse timber litter) under the light forecast winds isn't expected "
+            "to advance. The forecast shown is the fire's current perimeter."
+        )
+    elif result.get("properties", {}).get("low_spread"):
         notes.append(
             "ForeFire modeled only minimal spread here — light forecast winds "
             "and/or sparse fuel. The isochrones are close together."
         )
 
-    return PredictResponse(
-        engine="forefire",
-        parameters=_params(req, inputs),
-        isochrones=result,
-        notes=notes,
-    )
+    # ML residual correction (Phase 5, opt-in): rescale the footprint by the learned
+    # observed/forecast factor. Features are always computed (and returned under
+    # parameters.ml_features for parity checks); the rescale only happens when enabled
+    # and the model + libs are present.
+    feat = _ml_features(req, inputs)
+    # Skip ML rescaling when the physics engine modeled a genuinely static (no-spread)
+    # fire: there's nothing to correct, and inflating a stationary perimeter with a MOS
+    # factor would fabricate spread the fuel/wind don't support.
+    if not static and get_settings().ml_correction and ml_correction.available():
+        factor = ml_correction.correction_factor(feat)
+        if factor is not None:
+            ml_correction.scale_isochrones(result, factor, inputs["origin_lat"],
+                                           inputs["origin_lon"], inputs.get("initial_polygon"))
+            notes.append(
+                f"ML residual correction applied: forecast area ×{factor:.2f} "
+                "(learned observed/forecast; see validation/train_correction.py)."
+            )
+
+    params = _params(req, inputs)
+    params["ml_features"] = feat
+    return PredictResponse(engine="forefire", parameters=params, isochrones=result, notes=notes)
+
+
+def _ml_features(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]:
+    """Forecast-time features for the ML correction, matching the training columns
+    (validation/build_features.py) as closely as the server can. Note: `momentum` and
+    `peak_gust` aren't available server-side (live forecasts) → NaN, which the model
+    handles; this is the known feature-parity gap between the Phase-4 evaluation
+    (exact features) and live inference."""
+    nan = float("nan")
+    mean_wind, peak_wind, peak_gust, dir_cons = inputs.get("wind_feats") or (nan, nan, nan, nan)
+    poly = inputs.get("initial_polygon")
+    t0_km2 = (poly.area / 1_000_000.0) if poly is not None else 1.0
+    t, rh = inputs.get("temp_used"), inputs.get("rh_used")
+    if t is not None and rh is not None:
+        vpd = max(0.0, 0.6108 * math.exp(17.27 * t / (t + 237.3)) * (1 - rh / 100.0))
+        hdw = vpd * (peak_wind / 3.6) if peak_wind == peak_wind else nan
+    else:
+        vpd = hdw = nan
+    return {
+        "month": req.season_month or datetime.datetime.utcnow().month,
+        "log_t0": math.log(max(t0_km2, 1.0)),
+        "momentum": req.momentum if req.momentum is not None else nan,
+        "mean_wind": mean_wind, "peak_wind": peak_wind, "peak_gust": peak_gust,
+        "dir_consistency": dir_cons,
+        "temp_c": t if t is not None else nan,
+        "rh": rh if rh is not None else nan,
+        "vpd": vpd, "hdw": hdw,
+        "fuel_model": inputs["fuel"]["code"], "slope_pct": inputs["slope_percent"],
+        "horizon_h": req.duration_hours,
+    }
 
 
 def _params(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]:
