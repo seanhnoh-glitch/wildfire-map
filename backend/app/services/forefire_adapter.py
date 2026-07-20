@@ -935,43 +935,65 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
         })
 
     if not features:
-        # ForeFire modeled zero spread. If we were seeded from a real perimeter
-        # (a hindcast or an active-fire footprint), that's a legitimate forecast —
-        # wet/sparse fuel (e.g. TL5 timber litter) under light wind genuinely may
-        # not advance over a few hours. Return the CURRENT perimeter as a static
-        # forecast rather than failing outright. Only a bare point ignition that
-        # never caught has nothing to show, so that still raises.
-        if initial_polygon is None:
+        # No fronts across every step. A genuine seeding failure (no nodes placed)
+        # is a real error and always raises.
+        if n_seed <= 0:
             raise ForeFireUnavailable(
-                "ForeFire produced no fire fronts — the fire may not have spread "
-                f"under {prop_model} with fuel {fuel_code} (index {fuel_int}). "
-                "Check the fuel/wind inputs."
+                "ForeFire could not seed a fire front from the ignition perimeter "
+                f"(fuel {fuel_code}, index {fuel_int}). The perimeter geometry may "
+                "be invalid or outside the fuel domain."
             )
-        static_ring = [
-            list(local_meters_to_lonlat(origin_lat, origin_lon, x, y))
-            for x, y in initial_polygon.exterior.coords
-        ]
-        area_km2 = _ring_area_km2(static_ring, origin_lat, origin_lon)
-        minutes = len(wind_series) * req.step_minutes
-        log.warning(
-            "ForeFire modeled no spread for fuel %s (index %d) under light wind — "
-            "returning the static current perimeter (%.2f km²) as the forecast.",
-            fuel_code, fuel_int, area_km2,
-        )
-        features.append({
-            "type": "Feature",
-            "geometry": {"type": "Polygon", "coordinates": [static_ring]},
-            "properties": {
-                "step": len(wind_series),
-                "minutes": minutes,
-                "hours": round(minutes / 60.0, 2),
-                "head_distance_km": 0.0,
-                "area_km2": round(area_km2, 3),
-                "wind_speed_kmh": round(wind_series[-1][0], 1),
-                "wind_from_deg": round(wind_series[-1][1], 1),
-                "static_no_spread": True,
-            },
-        })
+        if initial_polygon is not None:
+            # Seeded from a real perimeter but modeled zero spread — wet/sparse fuel
+            # (e.g. TL5 timber litter) under light wind genuinely may not advance over
+            # a few hours. Return the CURRENT perimeter as a static forecast so the
+            # map still shows the footprint rather than failing.
+            static_ring = [
+                list(local_meters_to_lonlat(origin_lat, origin_lon, x, y))
+                for x, y in initial_polygon.exterior.coords
+            ]
+            area_km2 = _ring_area_km2(static_ring, origin_lat, origin_lon)
+            minutes = len(wind_series) * req.step_minutes
+            log.warning(
+                "ForeFire modeled no spread for fuel %s (index %d) under light wind — "
+                "returning the static current perimeter (%.2f km²) as the forecast.",
+                fuel_code, fuel_int, area_km2,
+            )
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [static_ring]},
+                "properties": {
+                    "step": len(wind_series),
+                    "minutes": minutes,
+                    "hours": round(minutes / 60.0, 2),
+                    "head_distance_km": 0.0,
+                    "area_km2": round(area_km2, 3),
+                    "wind_speed_kmh": round(wind_series[-1][0], 1),
+                    "wind_from_deg": round(wind_series[-1][1], 1),
+                    "static_no_spread": True,
+                },
+            })
+        else:
+            # Ignited from a bare point that caught but never advanced (grass/shrub
+            # models like GR2 have a low moisture of extinction, so a humid or calm
+            # hour yields zero rate of spread). Nothing to draw — return a valid
+            # "no spread" forecast with empty isochrones so the client can say so.
+            log.warning(
+                "ForeFire produced no fire fronts for fuel %s (index %d) — no spread "
+                "under the current winds/fuel moisture. Returning a no-spread forecast.",
+                fuel_code, fuel_int,
+            )
+            return {
+                "type": "FeatureCollection",
+                "features": [],
+                "properties": {
+                    "model": f"forefire-{prop_model.lower()}",
+                    "steps": 0,
+                    "seeded_from_perimeter": False,
+                    "no_spread": True,
+                    "fuel_code": fuel_code,
+                },
+            }
 
     # Report how much the fire grew, but do NOT reject a slow fire. A large
     # perimeter under light wind legitimately only gains a thin rind over a few
@@ -1097,6 +1119,31 @@ async def predict(req: PredictRequest) -> PredictResponse:
         # child; it is single-use and will exit on its own.
         pool.shutdown(wait=False, cancel_futures=True)
 
+    # No spread at all AND nothing to draw (a bare-point ignition that caught but the
+    # fuel doesn't propagate under the current winds/moisture, e.g. grass on a humid
+    # hour). Valid outcome, not an error — return empty isochrones with a plain-
+    # language note so the map can say "no spread expected" instead of a failure.
+    if result.get("properties", {}).get("no_spread"):
+        series = inputs["wind_series"]
+        wind_kmh = round(series[0][0], 0)
+        fm1 = inputs.get("moisture", {}).get("ones")
+        detail = f"winds near {wind_kmh:.0f} km/h"
+        if fm1 is not None:
+            detail += f" and ~{fm1 * 100:.0f}% dead fuel moisture"
+        notes.insert(
+            0,
+            f"No spread expected: {inputs['fuel']['name']} ({inputs['fuel']['code']}) "
+            f"does not propagate under the current conditions ({detail}).",
+        )
+        return PredictResponse(
+            engine="forefire",
+            parameters=_params(req, inputs),
+            isochrones={"type": "FeatureCollection", "features": []},
+            notes=notes,
+        )
+
+    # Seeded from a real perimeter but modeled zero spread: the forecast is the
+    # fire's current (static) perimeter. Note it and skip ML rescaling below.
     feats = result.get("features") or []
     static = bool(feats) and all(
         (f.get("properties") or {}).get("static_no_spread") for f in feats

@@ -30,6 +30,27 @@ WFIGS_PERIMS_URL = (
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query"
 )
+# Canadian active wildfires (CWFIS-derived, hosted as an ArcGIS FeatureServer of
+# incident *points*). Fields: Fire_Name, Latitude, Longitude, Hectares__Ha_,
+# Stage_of_Control (OC/BH/UC) + SoC_Text, Start_Date (epoch ms), Agency (province).
+# Canada reports a stage of control, not a containment %, so percent_contained
+# stays None for these and stage_of_control carries the status.
+CA_FIRES_URL = (
+    "https://services.arcgis.com/fFPraSowbm3gs7ek/arcgis/rest/services/"
+    "ActiveWildfiresInCanada/FeatureServer/0/query"
+)
+# Canadian fire perimeters: CWFIS Fire M3 current-day estimates (polygons derived
+# from buffered season-to-date satellite hotspots), served as GeoServer WFS. These
+# are SATELLITE ESTIMATES, not agency-surveyed lines like the US perimeters — NRCan
+# labels them non-operational — but they're the best national footprint layer.
+# Attributes: uid, hcount, firstdate, lastdate, area (hectares).
+CA_PERIMS_URL = (
+    "https://cwfis.cfs.nrcan.gc.ca/geoserver/public/ows"
+    "?service=WFS&version=1.0.0&request=GetFeature"
+    "&typeName=public:m3_polygons_current&outputFormat=application/json&srsName=EPSG:4326"
+)
+HECTARES_TO_ACRES = 2.47105
+
 # NASA FIRMS area API (CSV). We use VIIRS aboard NOAA-20 — the primary
 # operational VIIRS satellite, with a denser/timelier NRT feed than the aging
 # Suomi-NPP. Day range is 2, not 1: NRT for the current day lags a few hours, so
@@ -336,11 +357,32 @@ async def nearby(lat: float, lon: float, radius_km: float) -> dict[str, Any]:
 
 async def all_active(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
     """
-    All current US wildfire incidents at/above `min_acres`, nationwide (no spatial
-    filter) — for showing every ongoing fire on the map at once. Points only
-    (no perimeters/hotspots) to keep the payload light. distance_km is 0 here
-    since there is no reference point; the client computes distance if it has one.
+    All current US + Canadian wildfire incidents at/above `min_acres`, nationwide
+    (no spatial filter) — for showing every ongoing fire on the map at once. Points
+    only (no perimeters/hotspots) to keep the payload light. Fetches both countries
+    concurrently; if one source fails the other is still returned. distance_km is 0
+    here since there is no reference point; the client computes distance if it has one.
     """
+    us, ca = await asyncio.gather(
+        all_active_us(min_acres=min_acres, limit=limit),
+        all_active_ca(min_acres=min_acres, limit=limit),
+        return_exceptions=True,
+    )
+    fires: list[Fire] = []
+    if isinstance(us, list):
+        fires.extend(us)
+    if isinstance(ca, list):
+        fires.extend(ca)
+    # If BOTH sources errored, surface the US error (the primary source) so the
+    # router still returns a clear 502 rather than an empty list.
+    if not isinstance(us, list) and not isinstance(ca, list):
+        raise us
+    fires.sort(key=lambda f: (f.size_acres or 0), reverse=True)
+    return fires[:limit]
+
+
+async def all_active_us(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
+    """All current US wildfire incidents (NIFC WFIGS points), largest first."""
     params = {
         "where": (
             "IncidentTypeCategory = 'WF' AND FireOutDateTime IS NULL "
@@ -377,6 +419,63 @@ async def all_active(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
             percent_contained=props.get("PercentContained"),
             discovery_time=_iso(props.get("FireDiscoveryDateTime")),
             county=props.get("POOCounty"), state=props.get("POOState"),
+            country="US",
+        ))
+    return fires
+
+
+async def all_active_ca(min_acres: float = 10.0, limit: int = 2000) -> list[Fire]:
+    """
+    All current Canadian wildfire incidents (CWFIS ActiveWildfiresInCanada points),
+    largest first. Sizes come in hectares (converted to acres); containment is a
+    categorical stage of control, not a percentage.
+    """
+    min_ha = min_acres / HECTARES_TO_ACRES
+    params = {
+        "where": f"Hectares__Ha_ >= {min_ha}",
+        "outFields": ",".join([
+            "OBJECTID", "Fire_Name", "Hectares__Ha_", "SoC_Text",
+            "Start_Date", "Agency",
+        ]),
+        "orderByFields": "Hectares__Ha_ DESC",
+        "resultRecordCount": limit,
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "f": "geojson",
+    }
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        resp = await client.get(CA_FIRES_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    return _ca_fires_from_geojson(data)
+
+
+def _ca_fires_from_geojson(data: dict[str, Any]) -> list[Fire]:
+    """Map the Canadian FeatureServer GeoJSON into our Fire schema."""
+    fires: list[Fire] = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        geom = feat.get("geometry") or {}
+        coords = geom.get("coordinates") or [None, None]
+        f_lon, f_lat = coords[0], coords[1]
+        if f_lat is None or f_lon is None:
+            continue
+        ha = props.get("Hectares__Ha_")
+        size_acres = round(ha * HECTARES_TO_ACRES, 1) if ha is not None else None
+        # Fire_Name is often an agency code (e.g. "2025_BC_2025-C22340"); tidy the
+        # separators so it reads a little better in the UI.
+        raw_name = (props.get("Fire_Name") or "Unnamed incident").strip()
+        name = raw_name.replace("_", " ")
+        fires.append(Fire(
+            id=f"CA{props.get('OBJECTID')}",
+            name=name,
+            lat=f_lat, lon=f_lon, distance_km=0.0,
+            size_acres=size_acres,
+            percent_contained=None,   # Canada reports stage of control, not a %
+            discovery_time=_iso(props.get("Start_Date")),
+            county=None, state=props.get("Agency"),
+            country="CA",
+            stage_of_control=props.get("SoC_Text"),
         ))
     return fires
 
@@ -438,10 +537,48 @@ async def _fetch_all_perimeters_raw() -> dict[str, Any]:
         return resp.json()
 
 
+async def _ca_perimeters(min_acres: float = 0.0) -> dict[str, Any]:
+    """
+    Canadian Fire M3 perimeter estimates as GeoJSON, normalised to the SAME
+    properties the US perimeters use (poly_IncidentName, poly_GISAcres) so the map
+    styles them identically and the shared snapshot cache / bbox filter treat them
+    the same. These are satellite-derived estimates (source=CWFIS-M3), not agency-
+    surveyed lines like the US perimeters.
+    """
+    min_ha = min_acres / HECTARES_TO_ACRES
+    async with httpx.AsyncClient(timeout=45.0, headers={"User-Agent": "WildfireMap/0.1"}) as client:
+        resp = await client.get(CA_PERIMS_URL)
+        resp.raise_for_status()
+        data = resp.json()
+
+    feats: list[dict[str, Any]] = []
+    for feat in data.get("features", []):
+        props = feat.get("properties") or {}
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        area_ha = props.get("area")
+        if area_ha is not None and area_ha < min_ha:
+            continue
+        feats.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "OBJECTID": props.get("uid"),
+                "poly_IncidentName": None,
+                "poly_GISAcres": round(area_ha * HECTARES_TO_ACRES, 1) if area_ha is not None else None,
+                "source": "CWFIS-M3",   # satellite-estimated, not agency-surveyed
+            },
+        })
+    return {"type": "FeatureCollection", "features": feats}
+
+
 async def _perimeter_index() -> list[tuple[tuple[float, float, float, float], float, dict]]:
-    """The cached nationwide perimeter index, refreshed at most every _PERIM_TTL_S.
-    On a refresh failure the previous snapshot is kept and served stale rather than
-    letting the overlay blank; only a cold-start failure (no snapshot yet) raises."""
+    """The cached nationwide (US + Canada) perimeter index, refreshed at most every
+    _PERIM_TTL_S. On a refresh failure the previous snapshot is kept and served stale
+    rather than letting the overlay blank; only a cold-start failure (no snapshot
+    yet) raises. The Canadian source is best-effort — if it fails, US perimeters
+    still populate the index (and vice versa)."""
     global _perim_index, _perim_fetched_at
     now = time.monotonic()
     if _perim_index is not None and (now - _perim_fetched_at) < _PERIM_TTL_S:
@@ -451,9 +588,21 @@ async def _perimeter_index() -> list[tuple[tuple[float, float, float, float], fl
         if _perim_index is not None and (now - _perim_fetched_at) < _PERIM_TTL_S:
             return _perim_index                       # another task refreshed while we waited
         try:
-            fc = await _fetch_all_perimeters_raw()
+            us_fc, ca_fc = await asyncio.gather(
+                _fetch_all_perimeters_raw(),
+                _ca_perimeters(),
+                return_exceptions=True,
+            )
+            # A cold start with both sources down has nothing to serve → re-raise.
+            if not isinstance(us_fc, dict) and not isinstance(ca_fc, dict):
+                raise us_fc if isinstance(us_fc, BaseException) else ca_fc
+            merged: list[dict] = []
+            if isinstance(us_fc, dict):
+                merged.extend(us_fc.get("features") or [])
+            if isinstance(ca_fc, dict):
+                merged.extend(ca_fc.get("features") or [])
             index = []
-            for f in fc.get("features") or []:
+            for f in merged:
                 bb = _geom_bbox(f.get("geometry"))
                 if bb is None:
                     continue
@@ -498,13 +647,13 @@ async def perimeters_in_bbox(
     min_acres: float = 10.0, offset: float = 0.0, limit: int = 1500,
 ) -> dict[str, Any]:
     """
-    Current fire perimeters intersecting a lon/lat bounding box, as GeoJSON, served
-    from the single cached nationwide snapshot (see _perimeter_index). The snapshot
-    is kept at ~40 m resolution, so zoomed-in views are crisp WITHOUT a per-pan live
-    ArcGIS query (which rate-limited under burst and made the overlay coarse or blank
-    when it failed). Serving both the map draw AND the forecast button from this one
-    source means they can never disagree. `offset` is accepted for API compatibility
-    but ignored — the snapshot resolution is fixed.
+    Current fire perimeters (US + Canada) intersecting a lon/lat bounding box, as
+    GeoJSON, served from the single cached nationwide snapshot (see _perimeter_index).
+    The snapshot is kept at ~40 m resolution, so zoomed-in views are crisp WITHOUT a
+    per-pan live ArcGIS query (which rate-limited under burst and made the overlay
+    coarse or blank when it failed). Serving both the map draw AND the forecast button
+    from this one source means they can never disagree. `offset` is accepted for API
+    compatibility but ignored — the snapshot resolution is fixed.
     """
     index = await _perimeter_index()
     return _snapshot_bbox(index, west, south, east, north, min_acres, limit)

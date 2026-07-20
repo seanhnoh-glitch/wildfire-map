@@ -20,7 +20,7 @@ class GeocodeResult(BaseModel):
 # --- Fires -------------------------------------------------------------------
 
 class Fire(BaseModel):
-    """A single active wildfire incident (from NIFC WFIGS)."""
+    """A single active wildfire incident (US NIFC WFIGS or Canadian CWFIS)."""
     id: str
     name: str
     lat: float
@@ -31,6 +31,13 @@ class Fire(BaseModel):
     discovery_time: Optional[str] = None
     county: Optional[str] = None
     state: Optional[str] = None
+    # Which country the incident is in ("US" or "CA"), so the client can label the
+    # source and pick the right containment semantics.
+    country: Optional[str] = None
+    # Canada reports a categorical "stage of control" (Out of Control / Being Held /
+    # Under Control) rather than a containment percentage, so percent_contained is
+    # None for Canadian fires and this carries the status instead.
+    stage_of_control: Optional[str] = None
 
 
 class NearbyFiresResponse(BaseModel):
