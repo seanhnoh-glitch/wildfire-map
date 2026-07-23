@@ -1,9 +1,9 @@
 # Wildfire Map 🔥🗺️
 
-An interactive map of **active US wildfires**. Open it, see every ongoing fire and
-its mapped perimeter, tap one, and get a **forecast of where it's predicted to
-spread** over the next 24 hours — driven by a real fire-behavior simulator using
-live wind, fuel, terrain, and moisture.
+An interactive map of **active US and Canadian wildfires**. Open it, see every
+ongoing fire and its mapped perimeter, tap one, and get a **forecast of where it's
+predicted to spread** over the next 24 hours — driven by a real fire-behavior
+simulator using live wind, fuel, terrain, and moisture.
 
 - **Backend:** FastAPI service that aggregates live fire, weather, fuel, and
   terrain data and runs the spread simulation. It also **serves the web map**.
@@ -17,26 +17,31 @@ live wind, fuel, terrain, and moisture.
   below.
 
 > ⚠️ Research/education project. Forecasts are **not** operational fire-behavior
-> guidance. In a real emergency follow official sources (InciWeb, Watch Duty,
-> local authorities).
+> guidance. In a real emergency follow official sources — **US:** InciWeb, Watch
+> Duty, local authorities; **Canada:** CWFIS, your provincial/territorial emergency
+> management, and the Canadian Red Cross.
 
 ## What it does
 
 | Feature | Status |
 |---|---|
-| Every active US wildfire nationwide (NIFC WFIGS points) | ✅ live |
-| Mapped fire perimeters, detail-on-demand when you zoom in | ✅ live |
+| Every active **US + Canadian** wildfire nationwide (NIFC WFIGS + CWFIS points) | ✅ live |
+| Mapped perimeters — **US NIFC** surveyed lines + **Canadian CWFIS M3** satellite footprints, detail-on-demand when you zoom in | ✅ live |
+| **One dot per mapped footprint** (perimeter-driven), sized to the drawn fire, dropped onto the polygon | ✅ live |
 | Satellite hotspots (NASA FIRMS, VIIRS/NOAA-20) when zoomed in | ✅ live *(needs a free key)* |
 | Live weather / wind (NWS → Open-Meteo) | ✅ live |
-| Fuel across the fire domain (LANDFIRE FBFM40 grid) | ✅ live |
+| Fuel across the fire domain — **LANDFIRE FBFM40 (US CONUS + Alaska)** and **CWFIS/CFFDRS FBP (Canada)** | ✅ live |
 | **Water / urban / rock as non-burnable barriers the fire stops at** | ✅ live |
 | Dead-fuel moisture from live humidity/temperature (Simard EMC) | ✅ live |
 | 10 m → midflame wind reduction (per-fuel adjustment factor) | ✅ live |
 | Real terrain slope **and aspect** (uphill direction) | ✅ live |
-| HRRR-backed hourly forecast wind → fire bends as the wind shifts | ✅ live |
-| Ignition from the real NIFC perimeter footprint | ✅ live |
+| HRRR-backed hourly forecast wind → fire bends as the wind shifts; **wind veer/backing shown** | ✅ live |
+| Ignition from the real mapped perimeter footprint | ✅ live |
 | ForeFire front-tracking simulation → animated 24 h isochrones | ✅ live |
-| **Traffic-aware evacuation routes away from the fire** (Mapbox + FEMA/OSM shelters) | ✅ live *(needs a free Mapbox token for drive routes)* |
+| **Containment credit** — a partly-contained fire only grows along its *uncontained* perimeter | ✅ live |
+| **No forecast for fully-controlled fires** — US 100% contained / Canada "Under Control" | ✅ live |
+| **Directional-spread diagnostic** — head vs backing growth, so you can tell a wind-driven run from uniform spread | ✅ live |
+| **Traffic-aware evacuation routes away from the fire**, **country-aware** (FEMA/OSM in the US, Canadian Red Cross/OSM in Canada) with reverse-geocoded **street addresses** | ✅ live *(Mapbox token upgrades drive routes to live traffic; keyless OSRM otherwise)* |
 
 Full source list: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**. How the ForeFire
 engine is wired: **[docs/FOREFIRE_SETUP.md](docs/FOREFIRE_SETUP.md)**.
@@ -78,9 +83,9 @@ Run the offline unit tests with `python -m pytest`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | The web map (single-page app) |
-| GET | `/geocode?address=` | Address / place → lat/lon |
-| GET | `/fires/all?min_acres=&limit=` | Every active US wildfire (points) |
-| GET | `/perimeters/all?min_acres=` | All mapped perimeters (simplified) |
+| GET | `/geocode?address=` | Address / place (US or Canada) → lat/lon |
+| GET | `/fires/all?min_acres=&limit=` | Every active US + Canadian wildfire (points) |
+| GET | `/perimeters/all?min_acres=` | All mapped perimeters, US + Canada (simplified) |
 | GET | `/perimeters/bbox?west=&south=&east=&north=` | Full-res perimeters in a viewport |
 | GET | `/hotspots/bbox?west=&south=&east=&north=` | FIRMS hotspots in a viewport |
 | GET | `/fires/nearby?lat=&lon=&radius_km=` | Fires + perimeters + hotspots near a point |
@@ -105,16 +110,22 @@ web map  backend/app/web/index.html   (served at /)   ← primary UI
 backend (FastAPI)
    ├─ routers/            thin HTTP layer
    └─ services/
-        geocoding.py      US Census → OpenStreetMap Nominatim
-        fires.py          NIFC WFIGS points/perimeters + NASA FIRMS hotspots
+        geocoding.py      US Census → OpenStreetMap Nominatim (US + Canada); reverse
+        fires.py          NIFC WFIGS + CWFIS points/perimeters + NASA FIRMS hotspots
         weather.py        NWS → Open-Meteo (current + HRRR-backed hourly)
-        fuel.py           LANDFIRE FBFM40 (point + domain grid) → fuel codes
+        fuel.py           LANDFIRE FBFM40 (US CONUS + Alaska) & CWFIS/CFFDRS FBP (Canada)
         fuel_table.py     FARSITE fuel table + non-burnable barrier row
         terrain.py        Open-Meteo elevation → slope + aspect
         spread_model.py   perimeter → shapely polygon (ignition footprint)
-        forefire_adapter.py  gathers inputs, runs ForeFire, returns isochrones
-        evacuation.py     safe destinations (FEMA/OSM) + Mapbox traffic routing
+        forefire_adapter.py  gathers inputs, runs ForeFire, containment credit, isochrones
+        evacuation.py     country-aware safe destinations (FEMA/Red Cross/OSM) + routing
 ```
+
+Fuel source is chosen per fire: **US CONUS or Alaska → LANDFIRE**, **Canada → CWFIS
+FBP** (both encode water/urban/rock as the non-burnable barrier the fire stops at).
+Map dots are **perimeter-driven** — one dot per drawn footprint, US fires matched to
+their perimeter by name, Canadian fires (whose CWFIS points and M3 satellite polygons
+are separate datasets) matched spatially.
 
 The ForeFire simulation runs in a **fresh spawned subprocess** per request (the
 engine keeps process-global C++ state, so each forecast needs a clean process).
@@ -130,9 +141,15 @@ hotspots, dots centered on perimeters, the 24 h horizon and color styling). The
 
 ## Roadmap ideas
 
-- Full-resolution (30 m) water masking via a LANDFIRE raster export (today's
-  barrier grid is ~2–3 km, so it catches large water but not small ponds).
+- Higher-resolution water masking (today's barrier grid is ~2–3 km, so it catches
+  large water but not small ponds).
+- Fuel coverage for the **Alaska panhandle / far Aleutians** (west of −170°) and any
+  other gaps outside the LANDFIRE-CONUS/Alaska + CWFIS footprints (they fall back to a
+  labelled regional-default fuel today).
+- Field-validate the **Canadian FBP → FBFM40 crosswalk** (boreal conifer currently maps
+  to TL3 surface litter, with crown behaviour from the spotting model).
 - Raw NOMADS HRRR GRIB grids for a *spatial* wind field (not one point).
 - Fuel moisture that also accounts for recent precipitation and diurnal lag
   (Nelson dead-fuel model), and live fuel moisture from greenness/season.
-- Bring the mobile app to parity, or retire it in favor of the web map.
+- Bring the mobile app to parity (it still renders US-style only), or retire it in
+  favor of the web map.
