@@ -12,7 +12,7 @@ async def all_fires(
     min_acres: float = Query(10.0, ge=0, description="Only fires at/above this size"),
     limit: int = Query(2000, gt=0, le=5000),
 ):
-    """Every ongoing US wildfire (points only), largest first — for the overview map."""
+    """Every ongoing US + Canadian wildfire (points only), largest first — for the overview map."""
     try:
         return await fires_svc.all_active(min_acres=min_acres, limit=limit)
     except Exception as exc:
@@ -24,7 +24,7 @@ async def all_perimeters(
     min_acres: float = Query(100.0, ge=0, description="Only perimeters at/above this size"),
     limit: int = Query(1500, gt=0, le=3000),
 ):
-    """All current US fire perimeters (simplified) as a GeoJSON FeatureCollection."""
+    """All current US + Canadian fire perimeters (simplified) as a GeoJSON FeatureCollection."""
     try:
         return await fires_svc.all_perimeters(min_acres=min_acres, limit=limit)
     except Exception as exc:
@@ -112,6 +112,7 @@ async def evacuation(req: EvacuationRequest):
             lat=req.lat, lon=req.lon,
             fire_lat=req.fire_lat, fire_lon=req.fire_lon,
             avoid_geojson=req.avoid_geojson, max_routes=req.max_routes,
+            country=req.country,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Evacuation routing error: {exc}")

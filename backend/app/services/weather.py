@@ -73,7 +73,7 @@ async def _open_meteo(client: httpx.AsyncClient, lat: float, lon: float) -> Weat
 async def current(lat: float, lon: float) -> WeatherConditions:
     async with httpx.AsyncClient(
         timeout=20.0,
-        headers={"User-Agent": "WildfireMap/0.1 (contact: you@example.com)", "Accept": "application/geo+json"},
+        headers={"User-Agent": "WildfireMap/0.1 (wildfire-map prototype)", "Accept": "application/geo+json"},
     ) as client:
         try:
             result = await _nws(client, lat, lon)

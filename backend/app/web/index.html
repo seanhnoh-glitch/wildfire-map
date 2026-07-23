@@ -120,7 +120,7 @@
 
 <div class="search">
   <input id="addr" type="text" inputmode="search" enterkeyhint="search"
-         placeholder="Enter a US address or city" autocapitalize="words" autocomplete="off">
+         placeholder="Enter an address or city (US or Canada)" autocapitalize="words" autocomplete="off">
   <button id="locate" title="Use my location">◎</button>
 </div>
 <div id="toast" class="toast"></div>
@@ -257,22 +257,35 @@ function setSource(id, data, layers){
   layers.forEach(l => { if(!map.getLayer(l.id)) map.addLayer(l); });
 }
 
-// --- Place fire dots at the perimeter CENTER (not the incident point, which is
-// the point of origin and can sit at the edge of / outside the perimeter). We
-// match incidents to perimeters by name and use the area-centroid of the largest
-// ring. Fires without a mapped perimeter keep their incident point.
-// normalized name -> LIST of {center:[lon,lat], bounds:[[minLon,minLat],[maxLon,maxLat]]}.
-// A list, not one entry, because fire names collide ("Cottonwood" exists in several
-// states); keying by name alone would yank a flame to the wrong state's perimeter.
-let perimByName = {};
+// The map's fire dots are PERIMETER-DRIVEN: one dot per drawn footprint, placed at
+// its area-centroid, so every mapped fire has exactly one clickable dot sitting on it
+// (see rebuildDots). `fires` holds the raw incident points from /fires/all; `dots`
+// holds the merged display markers (perimeter dots + point-only incidents).
+let dots = [];
 function normName(s){ return (s||"").trim().toUpperCase().replace(/\s+/g," "); }
-// The perimeter of matching name NEAREST a fire's point — its own, not a namesake's.
-function perimForFire(f){
-  const cands = perimByName[normName(f.name)];
-  if(!cands || !cands.length) return null;
-  let best=cands[0], bd=Infinity;
-  for(const c of cands){ const dx=c.center[0]-f.lon, dy=c.center[1]-f.lat, d=dx*dx+dy*dy;
-    if(d<bd){ bd=d; best=c; } }
+// Ray-casting point-in-polygon test on a [lon,lat] ring.
+function pointInRing(x, y, ring){
+  let inside = false;
+  for(let i=0, j=ring.length-1; i<ring.length; j=i++){
+    const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
+    if(((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi)+xi)) inside = !inside;
+  }
+  return inside;
+}
+// Shortest distance (km) from a [lon,lat] point to a ring's EDGES (point→segment,
+// in a local km plane). Used to absorb incidents that sit just outside a perimeter.
+function ringDistKm(lon, lat, ring){
+  const kx = 111.320 * Math.cos(lat*Math.PI/180), ky = 110.574;   // km per deg lon / lat
+  let best = Infinity;
+  for(let i=0; i<ring.length-1; i++){
+    const ax=(ring[i][0]-lon)*kx,   ay=(ring[i][1]-lat)*ky;
+    const bx=(ring[i+1][0]-lon)*kx, by=(ring[i+1][1]-lat)*ky;
+    const dx=bx-ax, dy=by-ay, len2=dx*dx+dy*dy;
+    let t = len2>0 ? -(ax*dx+ay*dy)/len2 : 0;
+    t = t<0?0:(t>1?1:t);
+    const d = Math.hypot(ax+t*dx, ay+t*dy);
+    if(d<best) best=d;
+  }
   return best;
 }
 function ringBounds(r){
@@ -308,26 +321,149 @@ function ringCentroid(r){   // area centroid via the shoelace formula
   if(Math.abs(a)<1e-12){ let sx=0,sy=0; r.forEach(([x,y])=>{sx+=x;sy+=y;}); return [sx/r.length, sy/r.length]; }
   return [cx/(6*a), cy/(6*a)];
 }
-function buildPerimCenters(fc){
-  perimByName = {};
-  (fc && fc.features || []).forEach(f=>{
-    const nm = normName(f.properties && f.properties.poly_IncidentName);
-    if(!nm) return;
-    const ring = largestRing(f.geometry);
-    if(ring && ring.length>=4){
-      (perimByName[nm] = perimByName[nm] || []).push({ center: ringCentroid(ring), bounds: ringBounds(ring) });
+// How far (km) a Canadian perimeter reaches to claim the incident it represents. The
+// CWFIS incident point and the M3 satellite polygon of the same fire are separate
+// datasets and often a few km apart, so a small radius still joins them.
+const CLAIM_KM = 12;
+// How close (km) to a perimeter an incident must be to be absorbed into it. Matched to
+// the backend's non-containment ignition tolerance (_NONCONTAIN_MAX_DEG ≈ 2 km): any
+// incident the backend would forecast from THIS perimeter is folded into its one dot,
+// so a fire-complex cluster around a single mapped footprint can't produce several
+// dots that all forecast the same perimeter.
+const ABSORB_KM = 2.0;
+// Minimum footprint (acres) for an UNMATCHED perimeter to get its own dot, matching
+// the /fires/all incident floor so tiny perimeters without an incident don't clutter.
+const SYNTH_DOT_MIN_ACRES = 50;
+
+// Rebuild the display `dots` from the perimeters + incidents. Model: ONE dot per drawn
+// perimeter, at its centroid, labelled from the incident it represents; plus a point
+// dot for every incident that has no perimeter. This guarantees each mapped fire shows
+// exactly one dot, on the fire — fixing both "two dots on one fire" (a stray incident
+// point inside/beside a footprint) and "a fire with no dot" (a satellite perimeter with
+// no reported incident).
+//
+//   • US perimeters carry an incident name → claim the nearest same-named incident.
+//   • Canadian M3 perimeters have NO name → claim by size-aware proximity: among CA
+//     incidents within CLAIM_KM of the centroid, the one whose reported size best
+//     matches the polygon's area wins (so a small fire whose point happens to fall in a
+//     big neighbour's footprint can't hijack it).
+//   • Any incident sitting INSIDE a perimeter is absorbed into that perimeter's dot, so
+//     it doesn't add a second, redundant marker.
+//   • Incidents claimed/absorbed by no perimeter keep their own point dot.
+function rebuildDots(){
+  const perims = (nationalPerims && nationalPerims.features) || [];
+  const shapes = [];
+  for(const p of perims){
+    const ring = largestRing(p.geometry);
+    if(!(ring && ring.length>=4)) continue;
+    const pr = p.properties || {};
+    shapes.push({ ring, center: ringCentroid(ring), bounds: ringBounds(ring),
+      acres: pr.poly_GISAcres, name: pr.poly_IncidentName,
+      isCA: pr.source === "CWFIS-M3", oid: pr.OBJECTID,
+      // Incident attributes the US perimeter feed carries, for perimeter-only fires.
+      pc: pr.attr_PercentContained, state: pr.attr_POOState,
+      county: pr.attr_POOCounty, disc: pr.attr_FireDiscoveryDateTime });
+  }
+  const claimed = new Set();    // incident ids used as a perimeter's label
+  const absorbed = new Set();   // incident ids sitting inside some perimeter (hidden)
+  const out = [];
+  for(const sh of shapes){
+    const [m,M] = sh.bounds;
+    // Absorb any incident INSIDE this footprint OR within ABSORB_KM of its edge — the
+    // same distance the backend uses to ignite a point-seeded forecast from a nearby
+    // perimeter, so a cluster of incidents around one mapped footprint doesn't produce
+    // several dots that all forecast the same perimeter.
+    const eLat = ABSORB_KM/111, eLon = ABSORB_KM/(111*Math.cos(sh.center[1]*Math.PI/180));
+    for(const f of fires){
+      if(f.lon<m[0]-eLon || f.lon>M[0]+eLon || f.lat<m[1]-eLat || f.lat>M[1]+eLat) continue;
+      if(pointInRing(f.lon, f.lat, sh.ring) || ringDistKm(f.lon, f.lat, sh.ring) < ABSORB_KM)
+        absorbed.add(f.id);
     }
-  });
-}
-function applyPerimCenters(){   // move matched fires to their perimeter center, then redraw
-  let moved=0;
-  fires.forEach(f=>{ const c=perimForFire(f); if(c){ f.lon=c.center[0]; f.lat=c.center[1]; moved++; } });
+    // Claim the incident this perimeter represents.
+    let label = null;
+    if(!sh.isCA && sh.name){                      // US: nearest same-named incident
+      const nm = normName(sh.name); let bd = Infinity;
+      for(const f of fires){
+        if(normName(f.name) !== nm || claimed.has(f.id)) continue;
+        const d = (f.lon-sh.center[0])**2 + (f.lat-sh.center[1])**2;
+        if(d < bd){ bd = d; label = f; }
+      }
+    } else {                                       // CA / unnamed: size-aware proximity
+      const degLat = CLAIM_KM/111, degLon = CLAIM_KM/(111*Math.cos(sh.center[1]*Math.PI/180));
+      let best = Infinity;
+      for(const f of fires){
+        if(claimed.has(f.id)) continue;
+        if(sh.isCA && f.country !== "CA") continue;
+        if(Math.abs(f.lon-sh.center[0])>degLon || Math.abs(f.lat-sh.center[1])>degLat) continue;
+        const dkm = haversineKm(sh.center[1], sh.center[0], f.lat, f.lon);
+        if(dkm > CLAIM_KM) continue;
+        const dz = (f.size_acres && sh.acres) ? Math.abs(Math.log(f.size_acres/sh.acres)) : 2.0;
+        const score = dz + dkm/20;                 // size agreement dominant, distance secondary
+        if(score < best){ best = score; label = f; }
+      }
+    }
+    if(label) claimed.add(label.id);
+    // Skip a dot for a small UNMATCHED footprint: perimeters load down to 10 acres but
+    // incidents only to 50, so tiny US perimeters with no incident would otherwise each
+    // sprout a generic "Mapped fire perimeter" dot and clutter the map. The polygon is
+    // still drawn — just not marked. Matched perimeters (a real incident) always get a dot.
+    if(!label && (sh.acres || 0) < SYNTH_DOT_MIN_ACRES) continue;
+    // Dot carries the matched incident's metadata, else a footprint record enriched
+    // with whatever incident attributes the perimeter feed provided (US perimeter-only
+    // fires); CA M3 perimeters carry none, so those fields stay null.
+    const dot = label ? Object.assign({}, label) : {
+      // Prefix with the source so a US and a CA perimeter sharing an OBJECTID don't collide.
+      id: "perim-" + (sh.isCA ? "ca" : "us") + "-" + (sh.oid != null ? sh.oid : `${sh.center[0].toFixed(3)},${sh.center[1].toFixed(3)}`),
+      name: sh.name || (sh.isCA ? "Satellite-detected fire" : "Mapped fire perimeter"),
+      size_acres: sh.acres != null ? Math.round(sh.acres) : null,
+      percent_contained: sh.pc != null ? sh.pc : null, country: sh.isCA ? "CA" : "US",
+      stage_of_control: null, state: sh.state || null, county: sh.county || null,
+      discovery_time: sh.disc != null ? sh.disc : null,
+    };
+    dot.lon = sh.center[0]; dot.lat = sh.center[1];
+    dot.bounds = sh.bounds; dot.hasPerim = true; dot._acres = sh.acres || 0;
+    // Size = the LARGER of the incident's reported acreage and the mapped footprint
+    // area. Canadian CWFIS incidents report a tiny/stale acreage (e.g. 371 ac) while
+    // their M3 satellite footprint is enormous (e.g. 241,880 ac) — so the footprint wins
+    // and the fire no longer looks far smaller than it's drawn. For US fires the incident
+    // acreage is current while the perimeter lags 12–24 h, so the incident size wins and
+    // isn't replaced by a stale perimeter area.
+    if(sh.acres != null)
+      dot.size_acres = dot.size_acres != null ? Math.max(dot.size_acres, Math.round(sh.acres)) : Math.round(sh.acres);
+    out.push(dot);
+  }
+  for(const f of fires){                           // point-only incidents (no perimeter)
+    if(claimed.has(f.id) || absorbed.has(f.id)) continue;
+    out.push(Object.assign({}, f, { hasPerim:false }));
+  }
+  dots = mergeFragments(out);
   drawFirePoints();
-  // A fire whose sheet is already open may only now have gained a perimeter (and had
-  // its dot moved onto it), so re-evaluate its forecast button — this is what unblocks
-  // the "drawn perimeter but says can't forecast" case without needing a second click.
+  // A fire whose sheet is open may only now have gained/lost a perimeter dot, so
+  // re-evaluate its forecast button (unblocks "drawn perimeter but can't forecast").
   if(selected) refreshForecastAvailability(selected);
-  return moved;
+}
+
+// Satellite/agency mapping often splits ONE fire into several polygons across an
+// unburned gap (a lake, a rock band), which would show as several dots for one fire.
+// Collapse those: drop a smaller perimeter dot when it falls within a larger one's
+// reach (the larger's effective radius + a small gap), keeping just the larger dot.
+// The polygons themselves stay drawn — only the redundant marker is removed. Only
+// perimeter dots merge (point-only incidents are distinct reported fires); the size-
+// based reach keeps genuinely separate fires that merely sit near each other apart.
+const MERGE_GAP_KM = 2;
+function reachKm(acres){ return acres > 0 ? Math.sqrt(acres * 4046.86 / Math.PI) / 1000 : 0; }
+function mergeFragments(list){
+  const perim = list.filter(d => d.hasPerim).sort((a,b) => (b._acres||0) - (a._acres||0));
+  const keep = new Set();
+  for(const d of perim){
+    let covered = false;
+    for(const p of keep){                          // p is a larger, already-kept fire
+      if(p.country !== d.country) continue;
+      if(haversineKm(p.lat, p.lon, d.lat, d.lon) < reachKm(p._acres||0) + MERGE_GAP_KM){ covered = true; break; }
+    }
+    if(!covered) keep.add(d);
+  }
+  return list.filter(d => !d.hasPerim || keep.has(d));
 }
 
 // A crisp two-tone flame icon marking each fire's location. Drawn on a canvas from
@@ -351,7 +487,7 @@ function ensureFireImage(){
 
 function drawFirePoints(){
   ensureFireImage();
-  const pts = { type:"FeatureCollection", features: fires.map(f => ({
+  const pts = { type:"FeatureCollection", features: dots.map(f => ({
     type:"Feature", properties:{ id:f.id, name:f.name }, geometry:{ type:"Point", coordinates:[f.lon,f.lat] } })) };
   setSource("fires", pts, [
     // A soft dark halo under the dot so it reads over bright terrain too.
@@ -376,7 +512,7 @@ async function loadAllFires(quiet){
   if(!quiet) toast("Loading active wildfires…", 0);
   try {
     fires = await jget("/fires/all?min_acres=50&limit=2000");
-    applyPerimCenters();   // reposition onto perimeter centers if perimeters are loaded
+    rebuildDots();         // merge incidents with perimeters into one dot per fire
     refreshEvac();         // a location set before fires loaded can now find its nearest fire
     if(!quiet) toast(fires.length + " active wildfires nationwide — tap any dot, or search your area.");
   } catch(e){ if(!quiet) toast("Couldn't load fires: "+e.message); }
@@ -402,8 +538,7 @@ async function loadAllPerimeters(){
   try {
     nationalPerims = await jget("/perimeters/all?min_acres=10");
     setPerimeters(nationalPerims);
-    buildPerimCenters(nationalPerims);
-    if(fires.length) applyPerimCenters();   // reposition dots now that centers are known
+    rebuildDots();   // now that perimeters are known, rebuild one dot per fire footprint
   } catch(e){ /* best-effort overlay */ }
 }
 
@@ -526,7 +661,7 @@ const THREAT_ALERT_KM = 65;
 function frameNearbyFires(lat, lon){
   showMe(lat, lon);              // drop a marker so you can see exactly where your location is
   const RAD = THREAT_ALERT_KM;   // km considered "nearby / stay alert"
-  const near = fires
+  const near = dots
     .map(f => ({ f, d: haversineKm(lat, lon, f.lat, f.lon) }))
     .filter(o => o.d <= RAD)
     .sort((a,b) => a.d - b.d);
@@ -571,7 +706,7 @@ async function search(){
 // evacuation route straight from a location, without picking a fire first.
 function nearestFire(lat, lon, maxKm){
   let best=null, bestD=Infinity;
-  for(const f of fires){ const d=haversineKm(lat, lon, f.lat, f.lon);
+  for(const f of dots){ const d=haversineKm(lat, lon, f.lat, f.lon);
     if(d<=maxKm && d<bestD){ bestD=d; best=f; } }
   return best;
 }
@@ -624,6 +759,10 @@ function updateEvacFab(){
   fab.textContent = near ? "Plan evacuation route" : `No fire within ${THREAT_ALERT_KM} km`;
 }
 function refreshEvac(){ updateEvacBtn(); updateEvacFab(); }
+// Escape text from EXTERNAL feeds (fire names, county/state, stage of control,
+// destination names, reverse-geocoded addresses) before it goes into innerHTML, so a
+// stray/hostile value in upstream data can't inject markup.
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function fmtState(s){ return s ? s.replace(/^US-/,"") : null; }
 function fmtDiscovered(iso){
   if(!iso) return null;
@@ -654,14 +793,14 @@ function renderFireInfo(f){
   const loc = f.country === "CA"
     ? [fmtState(f.state), "Canada"].filter(Boolean).join(", ")
     : [f.county, fmtState(f.state)].filter(Boolean).join(", ");
-  if(loc) rows.push(["Location", loc]);
+  if(loc) rows.push(["Location", esc(loc)]);
   if(f.size_acres != null)
     rows.push(["Size", `${Number(f.size_acres).toLocaleString()} acres`]);
   if(f.percent_contained != null){
     const pct = Math.round(f.percent_contained);
     rows.push(["Containment", `${pct}%<div class="contain-bar"><div class="contain-fill" style="width:${Math.min(100,pct)}%"></div></div>`]);
   } else if(f.stage_of_control){
-    rows.push(["Stage of control", f.stage_of_control]);
+    rows.push(["Stage of control", esc(f.stage_of_control)]);
   }
   const when = fmtDiscovered(f.discovery_time);
   if(when) rows.push([f.country === "CA" ? "Started" : "Discovered", when]);
@@ -670,16 +809,16 @@ function renderFireInfo(f){
   const st = fireStatus(f);
   const src = f.country === "CA" ? "🇨🇦 CWFIS (Canada)" : "🇺🇸 NIFC (US)";
   box.innerHTML =
-    `<span class="status ${st.cls}">${st.text}</span>` +
+    `<span class="status ${st.cls}">${esc(st.text)}</span>` +
     rows.map(([lbl,val])=>`<div class="row"><span class="lbl">${lbl}</span><span class="val">${val}</span></div>`).join("") +
     `<div class="row"><span class="lbl">Source</span><span class="val">${src}</span></div>`;
 }
 // Whether the selected fire's forecast button can run, re-evaluated on demand.
-// The answer depends on the fire's MAPPED PERIMETER, and a fire's dot only moves
-// onto that perimeter once perimeters finish loading (applyPerimCenters). So a single
-// check at click time can run too early — before the dot is reconciled or the backend
-// snapshot is warm — and wrongly say "no perimeter" even while the polygon is drawn on
-// the map. We therefore:
+// The answer depends on the fire's MAPPED PERIMETER, and a fire only becomes a
+// perimeter dot once perimeters finish loading (rebuildDots). So a single check at
+// click time can run too early — before the dot is reconciled or the backend snapshot
+// is warm — and wrongly say "no perimeter" even while the polygon is drawn on the map.
+// We therefore:
 //   • re-run this whenever perimeters (re)load, so a late perimeter unblocks the button;
 //   • never let a stale "no" stick — each call re-enables optimistically first;
 //   • keep it enabled if the client already matched a perimeter for this fire — that
@@ -695,15 +834,21 @@ function refreshForecastAvailability(f){
     btn.textContent = "🛡️ 100% contained — no spread expected";
     return;
   }
+  // Canadian "Under Control" is the stage-of-control equivalent of 100% contained.
+  if(f.stage_of_control && f.stage_of_control.toLowerCase().includes("under control")){
+    btn.disabled = true;
+    btn.textContent = "🛡️ Under control — no spread expected";
+    return;
+  }
   btn.disabled = false;
   btn.textContent = "Forecast spread →";
   const who = f.id;
   jget(`/perimeters/at?lat=${f.lat}&lon=${f.lon}`).then(r=>{
     if(!selected || selected.id !== who) return;    // user opened a different fire meanwhile
-    // Only disable when the backend says no AND we have no client-side perimeter match.
-    // If perimeters are still loading, a later applyPerimCenters() re-runs this with the
-    // dot moved onto the polygon, and the answer flips to yes.
-    if(!r.has_perimeter && !perimForFire(f)){
+    // Only disable when the backend says no AND this dot isn't itself a perimeter dot.
+    // If perimeters are still loading, a later rebuildDots() re-runs this with the dot
+    // now representing the polygon, and the answer flips to yes.
+    if(!r.has_perimeter && !f.hasPerim){
       btn.disabled = true;
       btn.textContent = "No mapped perimeter — can't forecast";
     }
@@ -737,8 +882,7 @@ function openSheet(f){
   // Zoom to FIT the fire, not a fixed level: real perimeter bounds if we have
   // them, else a box from the acreage. Expanded ~1.8x so the forecast has room to
   // spread beyond the current perimeter without running off-screen.
-  const match = perimForFire(f);
-  let box = (match && match.bounds) || (f.size_acres != null ? boundsForAcres(f.lon, f.lat, f.size_acres) : null);
+  let box = f.bounds || (f.size_acres != null ? boundsForAcres(f.lon, f.lat, f.size_acres) : null);
   if (box) map.fitBounds(expandBounds(box, 1.8), { padding: framePad(50), maxZoom: 12, duration: 800 });
   else map.flyTo({ center:[f.lon,f.lat], zoom:10, padding: framePad(0) });
 }
@@ -785,12 +929,28 @@ function drawIso(pred){
   return maxH;
 }
 
+// Wind FROM-direction as an 8-point compass label, and a summary that surfaces a
+// DIRECTION CHANGE over the forecast (veering = clockwise, backing = anticlockwise).
+// A rotating wind spreads a fire on all sides, so showing only speed ("18→18 km/h")
+// hides why such a forecast looks uniform — the direction is the missing signal.
+const COMPASS8 = ["N","NE","E","SE","S","SW","W","NW"];
+function compass(deg){ return COMPASS8[Math.round((((deg%360)+360)%360)/45) % 8]; }
+function windSummary(p){
+  const s0=Math.round(p.wind_speed_kmh), s1=Math.round(p.wind_end_speed_kmh);
+  const spd = s0===s1 ? `${s0} km/h` : `${s0}→${s1} km/h`;
+  const d0=p.wind_direction_deg, d1=p.wind_end_direction_deg;
+  if(d0==null) return spd;
+  const dd = d1==null ? 0 : (((d1-d0)+540)%360)-180;   // signed turn: + veering, − backing
+  if(Math.abs(dd) < 30) return `${spd} from ${compass(d0)}`;
+  return `${spd}, from ${compass(d0)}→${compass(d1)} (${dd>0?"veering":"backing"})`;
+}
+
 async function runForecast(){
   if(!selected) return;
   const btn = document.getElementById("predictBtn"); btn.disabled = true; btn.textContent = "Forecasting…";
   try {
     prediction = await jpost("/predict", { lat:selected.lat, lon:selected.lon, duration_hours:FORECAST_HOURS, step_minutes:60,
-      percent_contained:selected.percent_contained });
+      percent_contained:selected.percent_contained, stage_of_control:selected.stage_of_control });
     // No forecast produced: fully contained, no mapped perimeter, or empty result.
     if (prediction.contained || prediction.no_perimeter || !(prediction.isochrones.features||[]).length){
       document.getElementById("fcInfo").textContent = (prediction.notes && prediction.notes[0])
@@ -812,7 +972,12 @@ async function runForecast(){
     const ACRE = 0.00404686;
     const aN = feats.reduce((a,b)=> b.properties.hours > a.properties.hours ? b : a, feats[0]).properties.area_km2 || 0;
     const a0km = feats.reduce((a,b)=> b.properties.hours < a.properties.hours ? b : a, feats[0]).properties.area_km2 || 0;
-    const cur = (selected.size_acres || a0km/ACRE);   // current fire size (acres)
+    // Baseline = the footprint the forecast actually IGNITED FROM (the first isochrone),
+    // not the reported incident size. For Canadian fires the CWFIS incident size can be a
+    // tiny/stale number (e.g. 371 ac) while the mapped satellite footprint it grows from
+    // is enormous (e.g. 241,880 ac) — using the incident size inflates the growth % into
+    // the tens-of-thousands of percent.
+    const cur = (a0km > 0 ? a0km/ACRE : (selected.size_acres || 1));   // current footprint (acres)
     const endAcres = aN/ACRE;
     const growthPct = cur > 0 ? (endAcres/cur - 1)*100 : 0;
     const minimal = !!props.low_spread || growthPct < 8;
@@ -821,20 +986,55 @@ async function runForecast(){
       ? `⚠︎ Minimal spread predicted — the perimeter barely changes (${growthTxt} over ${maxH}h).`
       : `Predicted growth ${growthTxt} over ${maxH}h (${Math.round(cur).toLocaleString()} → ${Math.round(endAcres).toLocaleString()} acres).`;
     const fcInfo = document.getElementById("fcInfo");
-    fcInfo.textContent = `${spread} · fuel ${p.fuel_model} · wind ${Math.round(p.wind_speed_kmh)}→${Math.round(p.wind_end_speed_kmh)} km/h`;
+    fcInfo.textContent = `${spread} · fuel ${p.fuel_model} · wind ${windSummary(p)}`;
     fcInfo.classList.toggle("minimal", minimal);
     // Detailed model inputs in the params sub-panel (the side/bottom sheet has room).
     const fuel = p.fuel_name ? `${p.fuel_name} (${p.fuel_model})` : (p.fuel_model || "—");
-    const windStart = Math.round(p.wind_speed_kmh);
-    const windEnd = Math.round(p.wind_end_speed_kmh);
-    const wind = windStart === windEnd ? `${windStart} km/h` : `${windStart} → ${windEnd} km/h`;
+    const wind = windSummary(p);
     const slope = p.slope_percent != null ? `${Math.round(p.slope_percent)}%` : "—";
     const ign = p.ignition === "perimeter" ? "mapped perimeter" : "incident point";
+    // Reported containment of the fire being forecast. It drives the forecast's
+    // suppression damping (see the "Suppression …" note when > 0), so state it
+    // outright here. Canada reports a categorical stage of control, not a percentage.
+    let containLabel, containVal;
+    if(selected.country === "CA"){
+      containLabel = "Stage of control";
+      containVal = selected.stage_of_control || "Not reported";
+    } else {
+      containLabel = "Containment";
+      const pc = selected.percent_contained;
+      containVal = pc == null ? "Not reported"
+                 : (pc <= 0 ? "0% (uncontained)" : `${Math.round(pc)}% contained`);
+    }
+    containVal = esc(containVal);   // stage_of_control comes from an external feed
+    // Directional-spread diagnostic: how far the fire's CENTROID shifts downwind between
+    // the first and last isochrone, relative to its overall radial growth. This is robust
+    // for large/irregular fires — the earlier max-extent delta wrongly read "head +0.0"
+    // for a big fire that grew on its flanks, and its rounded numbers could disagree with
+    // its own tag. A centroid that moves well downwind of its growth = a wind-driven head.
+    const first = feats.reduce((a,b)=> b.properties.hours < a.properties.hours ? b : a, feats[0]);
+    const last  = feats.reduce((a,b)=> b.properties.hours > a.properties.hours ? b : a, feats[0]);
+    let shape = "—";
+    try {
+      const c0 = ringCentroid(first.geometry.coordinates[0]);
+      const cN = ringCentroid(last.geometry.coordinates[0]);
+      const latm = (c0[1]+cN[1])/2;
+      const dx = (cN[0]-c0[0]) * 111.320 * Math.cos(latm*Math.PI/180);   // km east
+      const dy = (cN[1]-c0[1]) * 110.574;                                // km north
+      const tr = (((p.wind_end_direction_deg||0) + 180) % 360) * Math.PI/180;  // wind TOWARD
+      const downwind = dx*Math.sin(tr) + dy*Math.cos(tr);                // km centroid moved downwind
+      const growthR = Math.max(0.05, Math.sqrt(Math.max(0,aN)/Math.PI) - Math.sqrt(Math.max(0,a0km)/Math.PI));
+      const ratio = downwind / growthR;
+      const tag = ratio >= 0.6 ? "wind-driven head" : (ratio >= 0.25 ? "slightly directional" : "≈ uniform on all sides");
+      shape = `${tag} — centroid +${downwind.toFixed(1)} km downwind vs +${growthR.toFixed(1)} km radius`;
+    } catch(e){ shape = "—"; }
     document.getElementById("fcParams").innerHTML =
       `<div><b>Fuel:</b> ${fuel}</div>` +
       `<div><b>Wind:</b> ${wind}</div>` +
       `<div><b>Slope:</b> ${slope}</div>` +
       `<div><b>Ignition:</b> ${ign}</div>` +
+      `<div><b>${containLabel}:</b> ${containVal}</div>` +
+      `<div><b>Spread growth:</b> ${shape}</div>` +
       `<div><b>Engine:</b> ${prediction.engine}</div>` +
       (prediction.notes||[]).map(n=>`<div style="margin-top:6px;color:#9a6b00">${n}</div>`).join("");
     const hour = document.getElementById("hour"); hour.max = String(maxH); hour.value = String(maxH);
@@ -937,7 +1137,7 @@ async function planEvacuation(opts){
   const trigger=document.getElementById("evacBtn");
   if(!opts.auto){ if(trigger){ trigger.disabled=true; trigger.textContent="Finding safe routes…"; } toast("Finding safe routes…", 0); }
   try{
-    const body={ lat:origin.lat, lon:origin.lon, fire_lat:target.lat, fire_lon:target.lon, max_routes:3 };
+    const body={ lat:origin.lat, lon:origin.lon, fire_lat:target.lat, fire_lon:target.lon, max_routes:3, country:target.country };
     // If a forecast was run for THIS fire, avoid where it's GOING, not just where it is.
     if(target===selected && prediction && prediction.isochrones) body.avoid_geojson=prediction.isochrones;
     const res = await jpost("/evacuation", body);
@@ -982,7 +1182,7 @@ function renderRoutes(res, opts){
 
   box.innerHTML="";
   if(!routes.length){
-    box.innerHTML = `<div class="evacnote">No drive routes${res.notes&&res.notes.length? " — "+res.notes[0]:""}. Safe areas are marked on the map.</div>`;
+    box.innerHTML = `<div class="evacnote">No drive routes${res.notes&&res.notes.length? " — "+esc(res.notes[0]):""}. Safe areas are marked on the map.</div>`;
   }
   routes.forEach((r,i)=>{
     const color = r.passes_near_fire ? "#e0a020" : ROUTE_COLORS[i%ROUTE_COLORS.length];
@@ -991,11 +1191,16 @@ function renderRoutes(res, opts){
     const tag = r.recommended ? "Recommended" : (r.passes_near_fire ? "⚠️ passes near fire" : "alternate");
     const dest=r.destination;
     const badge = destBadge(dest);   // official designated shelter vs backup location
+    // Prefer the reverse-geocoded street address as the secondary line; fall back to
+    // the source detail. Show the address on its own line so the destination is findable.
+    const addr = dest.address || (dest.detail && dest.detail !== "open shelter" ? dest.detail : "");
     const el=document.createElement("div"); el.className = r.passes_near_fire ? "route warn" : "route";
     el.innerHTML =
       `<span class="swatch" style="background:${color}"></span>`+
-      `<div class="rtxt"><b>${dest.name}</b><span class="badge ${badge.cls}">${badge.text}</span>`+
-        `<small>${tag} · ${r.distance_km} km${dest.detail? " · "+dest.detail:""}</small></div>`+
+      `<div class="rtxt"><b>${esc(dest.name)}</b><span class="badge ${badge.cls}">${badge.text}</span>`+
+        `<small>${tag} · ${r.distance_km} km</small>`+
+        (addr ? `<small class="addr">📍 ${esc(addr)}</small>` : "")+
+      `</div>`+
       `<div class="reta"><b>${fmtMin(r.duration_min)}</b>${delay?`<small>${delay}</small>`:""}</div>`;
     el.onclick = ()=> selectRoute(i, routes);
     box.appendChild(el);
@@ -1092,7 +1297,7 @@ setInterval(()=>{
   }                                       // (calling it while zoomed in would clobber the crisp perimeters)
 }, REFRESH_MS);
 map.on("click", "fires-dot", (e)=>{ const id=e.features[0].properties.id;
-  const f = fires.find(x=>String(x.id)===String(id)); if(f) openSheet(f); });
+  const f = dots.find(x=>String(x.id)===String(id)); if(f) openSheet(f); });
 map.on("mouseenter","fires-dot",()=> map.getCanvas().style.cursor="pointer");
 map.on("mouseleave","fires-dot",()=> map.getCanvas().style.cursor="");
 

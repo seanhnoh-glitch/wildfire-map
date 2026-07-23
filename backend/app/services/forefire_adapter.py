@@ -257,10 +257,26 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
     wind_series, wind_source, raw_wind = await _build_wind_series(req, notes)
     wind_feats = ml_correction.wind_features(raw_wind)   # canonical, matches training
 
-    fuel_code = req.fuel_model or await fuel_svc.fuel_at(req.lat, req.lon)
+    # Fuel model at the point. US (CONUS or Alaska) → LANDFIRE FBFM40; Canada/elsewhere
+    # → the CWFIS CFFDRS FBP grid. If neither resolves, get_params falls back to GR2 —
+    # flagged as a default so the UI doesn't present a guess as a lookup.
+    in_us = fuel_svc.in_landfire(req.lat, req.lon)
+    if req.fuel_model:
+        fuel_code = req.fuel_model
+    elif in_us:
+        fuel_code = await fuel_svc.fuel_at(req.lat, req.lon)
+    else:
+        fuel_code = await fuel_svc.fuel_at_ca(req.lat, req.lon)
     fuel_params = fuel_svc.get_params(fuel_code)
     if req.fuel_model is None:
-        notes.append(f"Fuel model: {fuel_params['code']} ({fuel_params['name']}).")
+        if fuel_code:
+            src = "LANDFIRE" if in_us else "CWFIS FBP (Canada)"
+            notes.append(f"Fuel model: {fuel_params['code']} ({fuel_params['name']}) from {src}.")
+        else:
+            notes.append(
+                f"Fuel model: {fuel_params['code']} ({fuel_params['name']}) — regional default; "
+                "no fuel raster covered this point."
+            )
 
     slope = req.slope_percent
     uphill_bearing = None
@@ -327,13 +343,14 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
     else:
         spot_scale = regime
 
-    # Suppression: a free-spread model over-predicts fires that crews/control lines
-    # are holding. Damp the driving wind by a suppression signal — supplied directly
-    # (validation: recent growth momentum), else derived from reported containment.
+    # Suppression: a free-spread model over-predicts fires that crews are actively
+    # slowing. Damp the driving wind by an EXPLICIT suppression signal (validation:
+    # recent growth momentum). Reported containment is NOT folded in here — it's applied
+    # afterwards as a containment credit on the forecast GROWTH (predict()), which models
+    # control lines holding the lined fraction of the perimeter far more directly than a
+    # whole-fire wind reduction (and avoids double-counting).
     if get_settings().suppression_scaling:
         supp = req.suppression
-        if supp is None and req.percent_contained:
-            supp = (req.percent_contained / 100.0) * get_settings().containment_to_suppression
         supp = max(0.0, min(1.0, supp)) if supp is not None else 0.0
         if supp > 0.01:
             supp_mult = 1.0 - get_settings().suppression_damp * supp
@@ -381,8 +398,15 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
         ne_lon, ne_lat = local_meters_to_lonlat(origin_lat, origin_lon, domain_half, domain_half)
         _cfg = get_settings()
         want_dem = _cfg.terrain_dem
+        # US → LANDFIRE FBFM40; Canada/elsewhere → CWFIS CFFDRS FBP (both encode water/
+        # urban/rock as the non-burnable barrier the fire stops at).
+        fuel_grid_coro = (
+            fuel_svc.fuel_grid(sw_lon, sw_lat, ne_lon, ne_lat, sample_count=_cfg.fuel_grid_samples)
+            if in_us else
+            fuel_svc.fuel_grid_ca(sw_lon, sw_lat, ne_lon, ne_lat, sample_count=_cfg.fuel_grid_samples)
+        )
         fuel_grid, elev_grid = await asyncio.gather(
-            fuel_svc.fuel_grid(sw_lon, sw_lat, ne_lon, ne_lat, sample_count=_cfg.fuel_grid_samples),
+            fuel_grid_coro,
             terrain_svc.elevation_grid(sw_lon, sw_lat, ne_lon, ne_lat, n=_cfg.elev_grid_n) if want_dem
             else asyncio.sleep(0, result=None),
             return_exceptions=True,
@@ -392,8 +416,9 @@ async def _gather_inputs(req: PredictRequest) -> dict[str, Any]:
         if isinstance(elev_grid, Exception):
             elev_grid = None
         if fuel_grid:
+            _fuel_src = "LANDFIRE" if in_us else "CWFIS FBP"
             notes.append(
-                f"Fuel map: {fuel_grid['ncols']}×{fuel_grid['nrows']} LANDFIRE grid, "
+                f"Fuel map: {fuel_grid['ncols']}×{fuel_grid['nrows']} {_fuel_src} grid, "
                 f"{fuel_grid['nonburn_pct']:.0f}% non-burnable barrier (water/urban/rock)."
             )
         if elev_grid:
@@ -750,7 +775,9 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     # can't finish inside the time budget (it returns only the first hour or two).
     # Scaling resolution with the fire's radius keeps the node count — and thus
     # the work per step — roughly constant regardless of fire size, so all steps
-    # complete. Small fires stay at the 200 m floor; huge ones coarsen to ~2.5 km.
+    # complete. Small fires sit at the 60 m floor (fine enough to keep their shape);
+    # huge ones coarsen to ~2.5 km. The floor governs small-fire DETAIL; the worst-case
+    # node count is set by the divisor, so a finer floor doesn't slow the big fires.
     _s = get_settings()
     perim_res = min(_s.forefire_perim_res_max, max(_s.forefire_perim_res_min, fire_half / _s.forefire_perim_res_div))
     ff["spatialIncrement"] = max(10.0, perim_res / 20.0)
@@ -1028,6 +1055,59 @@ def _run_forefire(req: PredictRequest, inputs: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _apply_containment_cap(result: dict, contained_frac: float, origin_lat: float,
+                           origin_lon: float, t0_local) -> None:
+    """
+    Credit reported containment: a partly-contained fire can only grow along its
+    UNCONTAINED perimeter — control lines hold the rest — so scale each isochrone's
+    GROWTH beyond the current footprint by (1 − contained_frac). The current footprint
+    (t0_local, a shapely polygon in local metres) is preserved; 0% leaves the forecast
+    unchanged, 100% would collapse it to the current perimeter (handled by the guard).
+
+    Each isochrone is scaled about its centroid to the target area
+    a0 + (1−contained)·(a_i − a0), then unioned with t0_local so it never falls below the
+    current perimeter. Edits the isochrone FeatureCollection in place.
+    """
+    if contained_frac <= 0.0 or t0_local is None or t0_local.is_empty:
+        return
+    from shapely.affinity import scale as shp_scale
+    from shapely.geometry import Polygon, mapping
+    from shapely.ops import transform, unary_union
+
+    uncontained = max(0.0, 1.0 - contained_frac)
+    a0 = t0_local.area
+    if a0 <= 0:
+        return
+
+    def to_local(f):
+        ring = (f["geometry"].get("coordinates") or [[]])[0]
+        p = Polygon([lonlat_to_local_meters(origin_lat, origin_lon, lo, la) for lo, la in ring])
+        return p if p.is_valid else p.buffer(0)
+
+    def _to_lonlat(x, y, z=None):
+        return local_meters_to_lonlat(origin_lat, origin_lon, x, y)
+
+    for f in result.get("features", []):
+        if (f.get("geometry") or {}).get("type") != "Polygon":
+            continue
+        p = to_local(f)
+        if p.is_empty:
+            continue
+        ai = p.area
+        if ai <= a0:                       # no growth beyond the current footprint
+            continue
+        a_target = a0 + uncontained * (ai - a0)
+        k = math.sqrt(max(1e-6, a_target / ai))
+        p = shp_scale(p, xfact=k, yfact=k, origin="centroid")
+        p = unary_union([p, t0_local])     # never below the current perimeter
+        if p.geom_type == "MultiPolygon":
+            p = max(p.geoms, key=lambda g: g.area)
+        f["geometry"] = mapping(transform(_to_lonlat, p))
+        props = f.get("properties") or {}
+        if "area_km2" in props:
+            props["area_km2"] = round(p.area / 1_000_000.0, 3)
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -1049,6 +1129,23 @@ async def predict(req: PredictRequest) -> PredictResponse:
             notes=[
                 "This fire is reported 100% contained — it has a complete control "
                 "line and no outward spread is expected, so no forecast was run."
+            ],
+            contained=True,
+        )
+
+    # Canadian equivalent of the 100%-contained guard. Canada reports a categorical
+    # stage of control instead of a percentage; "Under Control" means the fire is not
+    # projected to spread (sufficient suppression, controlled edge), so — like a fully-
+    # contained US fire — a free-spread forecast is meaningless and is skipped.
+    if req.stage_of_control and "under control" in req.stage_of_control.lower():
+        return PredictResponse(
+            engine="forefire",
+            parameters={"origin": {"lat": req.lat, "lon": req.lon},
+                        "stage_of_control": req.stage_of_control},
+            isochrones={"type": "FeatureCollection", "features": []},
+            notes=[
+                "This fire is reported “Under Control” — it is not projected to spread "
+                "beyond its current perimeter, so no forecast was run."
             ],
             contained=True,
         )
@@ -1177,6 +1274,23 @@ async def predict(req: PredictRequest) -> PredictResponse:
                 f"ML residual correction applied: forecast area ×{factor:.2f} "
                 "(learned observed/forecast; see validation/train_correction.py)."
             )
+
+    # Containment credit: a partly-contained fire only grows along its UNCONTAINED
+    # perimeter — the lined fraction is held by control lines. Scale the forecast growth
+    # (beyond the current footprint) by the uncontained fraction, so a heavily-contained
+    # fire shows realistic growth instead of a full free-spread worst case. Applied last,
+    # to the final (post-ML) footprint. 100% is handled by the guard above; a genuinely
+    # static (no-spread) forecast has no growth to scale.
+    pc = req.percent_contained
+    if (pc is not None and 0.0 < pc < 100.0 and not static
+            and inputs.get("initial_polygon") is not None):
+        _apply_containment_cap(result, pc / 100.0, inputs["origin_lat"],
+                               inputs["origin_lon"], inputs["initial_polygon"])
+        notes.append(
+            f"Containment credit: {pc:.0f}% of the perimeter is lined, so forecast growth "
+            f"beyond the current footprint is scaled to the uncontained {100 - pc:.0f}% "
+            "(control lines hold the rest)."
+        )
 
     params = _params(req, inputs)
     params["ml_features"] = feat

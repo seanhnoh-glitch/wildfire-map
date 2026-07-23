@@ -87,9 +87,14 @@ class PredictRequest(BaseModel):
     ignite_from_perimeter: bool = True
     # Reported containment (0-100%) of the fire being forecast, if known. At 100%
     # the fire has a complete control line and won't spread, so the free-spread
-    # forecast is skipped; below 100% it's used to hedge the forecast as a worst
-    # case. Supplied by the client (the map knows it from the fire record).
+    # forecast is skipped; below 100% the forecast growth is scaled to the uncontained
+    # fraction (control lines hold the rest). Supplied by the client (from the fire record).
     percent_contained: Optional[float] = None
+    # Canadian stage of control ("Out of Control" / "Being Held" / "Under Control").
+    # "Under Control" is the stage-of-control equivalent of 100% contained — the fire is
+    # not projected to spread — so the forecast is skipped just like a 100%-contained US
+    # fire. Canada reports this instead of a containment percentage.
+    stage_of_control: Optional[str] = None
 
     # --- Hindcast / retrospective overrides (used by validation/retrospective) ---
     # Ignite from this explicit GeoJSON geometry instead of the nearest live
@@ -151,6 +156,10 @@ class EvacuationRequest(BaseModel):
     # If omitted the nearest live perimeter is fetched and avoided.
     avoid_geojson: Optional[dict] = None
     max_routes: int = Field(default=3, ge=1, le=6)
+    # Country of the fire/user ("US" or "CA"), so the guidance points at the right
+    # authority and the US-only FEMA shelter feed is skipped in Canada. Optional;
+    # unknown falls back to US-style guidance.
+    country: Optional[str] = None
 
 
 class EvacuationRoute(BaseModel):

@@ -16,6 +16,11 @@ shapely>=2.0
 # numpy builds the fuel/wind/elevation arrays passed to pyforefire.
 numpy>=1.24
 
+# Pillow decodes the CWFIS FBP fuel-type WMS image into a Canadian fuel grid
+# (services/fuel.fuel_grid_ca). Optional — that function no-ops (returns None → uniform
+# fuel fallback) if Pillow is absent, so US forecasts don't need it.
+Pillow>=10.0
+
 # Optional ML residual correction (Phase 5, off by default via ML_CORRECTION). Loads
 # a gradient-boosted model (trained by validation/train_correction.py) to rescale the
 # forecast footprint. Absent these, the correction simply no-ops. scikit-learn is

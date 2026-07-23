@@ -114,7 +114,12 @@ def test_fuel_moisture_from_humidity():
     humid = fa._fuel_moisture_from_weather(15.0, 90.0)   # cool & humid
     assert 0 < dry["ones"] < dry["tens"] < dry["hundreds"]
     assert dry["ones"] < humid["ones"]                   # drier air -> drier fuel
-    assert fa._fuel_moisture_from_weather(None, None) == fa._DEFAULT_MOISTURE
+    # With temp/RH missing, the DEAD fine-fuel components fall back to the dry defaults;
+    # the LIVE components come from the month-keyed seasonal curve (so they legitimately
+    # differ from the flat _DEFAULT_MOISTURE — see _seasonal_live_moisture).
+    fallback = fa._fuel_moisture_from_weather(None, None)
+    for k in ("ones", "tens", "hundreds"):
+        assert fallback[k] == fa._DEFAULT_MOISTURE[k]
 
 
 def test_wind_adjustment_factor_range():

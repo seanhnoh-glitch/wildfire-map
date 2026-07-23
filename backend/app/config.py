@@ -38,7 +38,12 @@ class Settings(BaseSettings):
     #   elev_grid_n:       DEM grid is elev_grid_n × elev_grid_n
     forefire_grid_n: int = 100
     forefire_perim_res_div: float = 90.0
-    forefire_perim_res_min: float = 200.0
+    # Front-node spacing floor (m). Small fires sit at this floor, so it sets how much
+    # perimeter detail a small-fire forecast keeps. The per-step cost is bounded by the
+    # DIVISOR (max nodes ≈ 2π·div ≈ 565, at fire_half = div·min), NOT the floor, so a
+    # finer floor sharpens small fires without raising the worst-case node count. 60 m
+    # keeps a few-hundred-acre fire's shape (was 200 m, which rounded it to ~20 nodes).
+    forefire_perim_res_min: float = 60.0
     forefire_perim_res_max: float = 2500.0
     forefire_time_budget_s: float = 150.0
     fuel_grid_samples: int = 900
@@ -115,7 +120,8 @@ class Settings(BaseSettings):
 
     # Mapbox access token. Powers the traffic-aware evacuation routing
     # (Directions `driving-traffic` profile) and can also upgrade the geocoder.
-    # Without it, /evacuation still returns safe destinations but no drive routes.
+    # Without it, /evacuation still returns drive routes via the keyless OSRM server
+    # (no live traffic) plus the safe destinations.
     mapbox_token: str = ""
 
     @property

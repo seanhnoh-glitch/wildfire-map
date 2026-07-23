@@ -524,7 +524,15 @@ def _geom_bbox(geom: Optional[dict]) -> Optional[tuple[float, float, float, floa
 async def _fetch_all_perimeters_raw() -> dict[str, Any]:
     params = {
         "where": f"poly_GISAcres >= {_PERIM_MIN_ACRES}",
-        "outFields": "OBJECTID,poly_IncidentName,poly_GISAcres",
+        # Include the incident attributes the perimeter feed carries (attr_*), so a
+        # perimeter with NO matching incident point (a "perimeter-only" fire like NASH)
+        # can still show containment / location / discovery in the UI instead of just a
+        # name and size. Harmless when a matching incident point exists (the client
+        # prefers the incident record).
+        "outFields": (
+            "OBJECTID,poly_IncidentName,poly_GISAcres,"
+            "attr_PercentContained,attr_POOState,attr_POOCounty,attr_FireDiscoveryDateTime"
+        ),
         "returnGeometry": "true",
         "maxAllowableOffset": str(_PERIM_OFFSET),
         "outSR": "4326",
@@ -620,8 +628,8 @@ async def _perimeter_index() -> list[tuple[tuple[float, float, float, float], fl
 
 async def all_perimeters(min_acres: float = 100.0, limit: int = 1500) -> dict[str, Any]:
     """
-    All current US fire perimeters at/above `min_acres`, nationwide, as a GeoJSON
-    FeatureCollection — for drawing every mapped footprint on the overview map.
+    All current US + Canadian fire perimeters at/above `min_acres`, nationwide, as a
+    GeoJSON FeatureCollection — for drawing every mapped footprint on the overview map.
     Served from the in-memory snapshot (see _perimeter_index); geometry is
     pre-simplified to ~40 m to keep the payload reasonable.
     """
@@ -671,13 +679,24 @@ async def has_perimeter_near(lat: float, lon: float, radius_km: float = 8.0) -> 
     return geom is not None and spread_model.perimeter_to_polygon(geom) is not None
 
 
+# A fire whose point is NOT inside any perimeter can still own the nearest one when its
+# incident point sits just outside its own footprint (common for US incident points,
+# which mark the point of origin). But only adopt such a non-containing perimeter when
+# it's genuinely close — a perimeter several km away belongs to a DIFFERENT fire. This
+# matters most for Canadian incidents, whose CWFIS points and M3 satellite perimeters
+# are separate datasets: without this cap a perimeter-less point grabs a large
+# neighbour's polygon whose bbox happens to reach it (the "two dots, one forecast" bug).
+# Containing matches are always accepted, however large the search box.
+_NONCONTAIN_MAX_DEG = 2.0 / 111.0   # ~2 km
+
+
 def _pick_perimeter(feats: list, lon: float, lat: float,
                     max_dist_deg: Optional[float] = None) -> Optional[dict[str, Any]]:
     """From candidate perimeter features pick the one CONTAINING the point (a fire's
-    own footprint), else the genuinely closest — so we don't seed from a neighbour.
-    If `max_dist_deg` is given, a non-containing nearest beyond that distance is
-    rejected (returns None), so a fire with no perimeter of its own doesn't pick up a
-    distant neighbour's perimeter just because their bounding boxes overlapped."""
+    own footprint), else the genuinely closest IF it's within the non-containing
+    tolerance (~2 km, further tightened by `max_dist_deg` when given) — so a fire with
+    no perimeter of its own doesn't pick up a distant neighbour's perimeter just because
+    their bounding boxes overlapped."""
     from shapely.geometry import Point, shape
     pt = Point(lon, lat)
     closest_geom = None
@@ -697,7 +716,8 @@ def _pick_perimeter(feats: list, lon: float, lat: float,
         d = pt.distance(poly)
         if d < closest_dist:
             closest_dist, closest_geom = d, geom
-    if max_dist_deg is not None and closest_dist > max_dist_deg:
+    cap = _NONCONTAIN_MAX_DEG if max_dist_deg is None else min(max_dist_deg, _NONCONTAIN_MAX_DEG)
+    if closest_geom is None or closest_dist > cap:
         return None
     return closest_geom
 

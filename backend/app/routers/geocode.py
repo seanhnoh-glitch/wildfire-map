@@ -7,7 +7,7 @@ router = APIRouter(tags=["geocode"])
 
 
 @router.get("/geocode", response_model=GeocodeResult)
-async def geocode_address(address: str = Query(..., min_length=3, description="US street address")):
+async def geocode_address(address: str = Query(..., min_length=3, description="US or Canadian address or city")):
     try:
         result = await geocoding.geocode(address)
     except Exception as exc:

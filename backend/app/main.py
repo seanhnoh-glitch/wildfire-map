@@ -31,7 +31,7 @@ settings = get_settings()
 app = FastAPI(
     title="Wildfire Map API",
     version="0.1.0",
-    description="Nearby active wildfires + wind-driven spread prediction for the US.",
+    description="Nearby active wildfires + wind-driven spread prediction for the US and Canada.",
 )
 
 app.add_middleware(
